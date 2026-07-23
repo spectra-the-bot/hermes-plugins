@@ -249,7 +249,7 @@ def _prepare_paths(paths: _Paths) -> None:
 
 
 def _cache_file(home_path: Path) -> Path:
-    return cast(Path, _DISK_CACHE.path(Path(os.path.abspath(os.fspath(home_path.expanduser())))))
+    return _DISK_CACHE.path(Path(os.path.abspath(os.fspath(home_path.expanduser()))))
 
 
 def _prepare_cache(home_path: Path, *, create_parent: bool) -> Path:
@@ -799,7 +799,7 @@ def _verified_cached_secrets(key: _CacheKey, cached: CachedFetch) -> dict[str, s
     return dict(sorted(verified.items()))
 
 
-class ProtonPassSource(SecretSource):  # type: ignore[misc]
+class ProtonPassSource(SecretSource):
     """Bulk runtime source backed by the official Proton Pass CLI."""
 
     name = "proton_pass"
@@ -1023,14 +1023,14 @@ class ProtonPassSource(SecretSource):  # type: ignore[misc]
                 "Provide a plain, read-only Proton Pass PAT; "
                 "Agent and human sessions are intentionally rejected."
             )
-        return cast(str, super().remediation(kind, cfg))
+        return super().remediation(kind, cfg)
 
     def fetch_timeout_seconds(self, cfg: dict[str, Any]) -> float:
         """Budget for lock contention plus the bounded noninteractive subprocesses."""
         timeout = _parse_positive_float(
             (cfg or {}).get("command_timeout_seconds"), _DEFAULT_TIMEOUT
         )
-        return max(cast(float, super().fetch_timeout_seconds(cfg)), timeout * 6 + 15)
+        return max(super().fetch_timeout_seconds(cfg), timeout * 6 + 15)
 
 
 def register(ctx: Any) -> None:
