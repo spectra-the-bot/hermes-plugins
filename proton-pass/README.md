@@ -102,7 +102,8 @@ package managers, and OpenSSL, curl, wget, Docker, Kubernetes, Hermes, and
 Proton Pass controls.
 Examples rejected in any letter case include `GIT_SSH_COMMAND`, `SSH_ASKPASS`,
 `JAVA_TOOL_OPTIONS`, `ALL_PROXY`, `XDG_CONFIG_HOME`, `NPM_CONFIG_PREFIX`,
-`OPENSSL_CONF`, `DOCKER_HOST`, and `KUBECONFIG`. This is a defense-in-depth
+`OPENSSL_CONF`, `DOCKER_HOST`, `KUBECONFIG`, `MAKEFLAGS`, and
+`PROMPT_COMMAND`. This is a defense-in-depth
 control list, not a claim to enumerate every environment variable interpreted
 by every executable. Ordinary secret destinations such as `AWS_ACCESS_KEY_ID`,
 `OPENAI_API_KEY`, and `DATABASE_URL` remain supported.

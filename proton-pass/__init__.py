@@ -79,7 +79,12 @@ _BLOCKED_ENV_NAMES = frozenset(
         "PAGER",
         "MANPAGER",
         "LESS",
+        "LESSOPEN",
+        "LESSCLOSE",
         "PROMPT",
+        "PROMPT_COMMAND",
+        "BASHOPTS",
+        "SHELLOPTS",
         "PSMODULEPATH",
         # Proxy and network trust controls.
         "HTTP_PROXY",
@@ -94,6 +99,13 @@ _BLOCKED_ENV_NAMES = frozenset(
         # Version-control client controls not covered by prefixes below.
         "CVS_RSH",
         "HGRCPATH",
+        "RSYNC_RSH",
+        # Build tools can execute commands supplied through these variables.
+        "MAKEFLAGS",
+        "MFLAGS",
+        "GNUMAKEFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
         # Runtime and package/tool configuration controls not covered by prefixes below.
         "_JAVA_OPTIONS",
         "JAVA_TOOL_OPTIONS",
@@ -1248,7 +1260,10 @@ class ProtonPassSource(SecretSource):
             _DEFAULT_TIMEOUT,
             maximum=_MAX_COMMAND_TIMEOUT_SECONDS,
         )
-        parent_budget = super().fetch_timeout_seconds(cfg)
+        try:
+            parent_budget = super().fetch_timeout_seconds(cfg)
+        except OverflowError:
+            parent_budget = 0.0
         if not math.isfinite(parent_budget) or parent_budget <= 0:
             parent_budget = 0.0
         return min(max(parent_budget, timeout * 6 + 15), _MAX_FETCH_TIMEOUT_SECONDS)

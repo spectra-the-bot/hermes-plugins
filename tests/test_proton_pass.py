@@ -542,6 +542,8 @@ def test_orchestrator_protects_bootstrap_token(
         "Shell",
         "Editor",
         "Pager",
+        "Prompt_Command",
+        "MakeFlags",
     ],
 )
 def test_runtime_control_destination_names_are_rejected(plugin_module, name):
@@ -559,20 +561,21 @@ def test_ordinary_api_secret_destinations_remain_supported(plugin_module, name):
 
 
 @pytest.mark.parametrize("override_existing", [False, True])
-def test_orchestrator_never_applies_git_ssh_command(
-    source, configured, tmp_path, monkeypatch, override_existing
+@pytest.mark.parametrize("name", ["GIT_SSH_COMMAND", "MAKEFLAGS", "PROMPT_COMMAND"])
+def test_orchestrator_never_applies_runtime_command_controls(
+    source, configured, tmp_path, monkeypatch, override_existing, name
 ):
     from agent.secret_sources import registry
 
     cfg, configure, _ = configured
     cfg["override_existing"] = override_existing
-    configure(payload={"items": [login_item("GIT_SSH_COMMAND", "fake-executable")]})
+    configure(payload={"items": [login_item(name, "fake-executable")]})
     registry._reset_registry_for_tests()
     monkeypatch.setattr(registry, "_ensure_builtin_sources", lambda: None)
     assert registry.register_source(source)
     env: dict[str, str] = {}
     report = registry.apply_all({"proton_pass": cfg}, tmp_path, environ=env)
-    assert "GIT_SSH_COMMAND" not in env
+    assert name not in env
     assert report.sources[0].result.error_kind == ErrorKind.INTERNAL
     registry._reset_registry_for_tests()
 
@@ -646,6 +649,28 @@ def test_fetch_budget_rejects_huge_finite_value_with_finite_default(source):
     budget = source.fetch_timeout_seconds({"command_timeout_seconds": 1e308})
     assert budget == source.fetch_timeout_seconds({"command_timeout_seconds": 30})
     assert budget < float("inf")
+
+
+def test_fetch_budget_handles_oversized_inherited_timeout_without_raising(source):
+    budget = source.fetch_timeout_seconds({"timeout_seconds": 10**1000})
+    assert budget == source.fetch_timeout_seconds({"command_timeout_seconds": 30})
+    assert budget < float("inf")
+
+
+def test_registry_handles_oversized_inherited_timeout(source, configured, tmp_path, monkeypatch):
+    from agent.secret_sources import registry
+
+    cfg, configure, _ = configured
+    cfg["timeout_seconds"] = 10**1000
+    configure(payload={"items": [login_item()]})
+    registry._reset_registry_for_tests()
+    monkeypatch.setattr(registry, "_ensure_builtin_sources", lambda: None)
+    assert registry.register_source(source)
+    env: dict[str, str] = {"EXISTING": "value"}
+    report = registry.apply_all({"proton_pass": cfg}, tmp_path, environ=env)
+    assert report.sources[0].result.error is None
+    assert env == {"EXISTING": "value", "OPENAI_API_KEY": "fake-secret"}
+    registry._reset_registry_for_tests()
 
 
 def test_not_configured_remediation_uses_plugin_keys(source):

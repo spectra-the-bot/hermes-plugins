@@ -12,6 +12,8 @@
   shell, loader, Git/SSH, proxy/trust, config/temp, runtime, package-manager,
   Windows, and common developer-tool controls while preserving ordinary API
   secret mappings.
+- Reject Make and interactive-shell command controls, and fail safely when an
+  oversized inherited host timeout cannot be converted to a float.
 
 ## 1.0.0
 
