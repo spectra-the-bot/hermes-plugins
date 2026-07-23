@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,7 @@ def custom_item(*fields, item_id: str = "2"):
 
 
 @pytest.fixture
-def fake_cli(tmp_path: Path, monkeypatch):
+def fake_cli(tmp_path: Path, monkeypatch, plugin_module):
     """Spy below run_secret_cli while keeping its env/stdin hardening active.
 
     Patching subprocess.run instead of using a shebang fixture keeps this test
@@ -56,6 +57,14 @@ def fake_cli(tmp_path: Path, monkeypatch):
     binary = tmp_path / ("pass-cli.exe" if os.name == "nt" else "pass-cli")
     binary.write_bytes(b"fake executable placeholder")
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    original_validator = plugin_module._validate_binary_path
+    monkeypatch.setattr(
+        plugin_module,
+        "_validate_binary_path",
+        lambda candidate: (
+            binary.resolve() if candidate == binary else original_validator(candidate)
+        ),
+    )
     config: dict = {"payload": {"items": []}}
     entries: list[dict] = []
 
@@ -119,6 +128,9 @@ def fake_cli(tmp_path: Path, monkeypatch):
                 }
             return completed(argv, int(config.get("info_rc", 0)), json.dumps(payload))
         if len(args) >= 2 and args[:2] == ["item", "list"]:
+            cache_path = config.get("assert_cache_absent")
+            if cache_path is not None:
+                assert not Path(cache_path).exists()
             if config.get("list_rc", 0):
                 return completed(
                     argv,
@@ -170,7 +182,9 @@ class TestProtonPassConformance(SecretSourceConformance):
     [
         ("Proton Pass CLI 2.1.0 (abc)", (2, 1, 0)),
         ("Proton Pass CLI 9.12.3", (9, 12, 3)),
-        ("2.0.2", (2, 0, 2)),
+        ("2.0.2", None),
+        ("Other Product 2.1.0", None),
+        ("prefix Proton Pass CLI 2.1.0", None),
         ("unknown", None),
     ],
 )
@@ -205,8 +219,12 @@ def test_config_schema_and_bootstrap_protection(source):
     schema = source.config_schema()
     assert schema["cache_ttl_seconds"]["default"] == 0
     assert schema["binary_path"]["default"] == ""
+    assert schema["override_existing"]["default"] is False
+    assert source.override_existing({}) is False
+    assert source.override_existing({"override_existing": True}) is True
     assert source.protected_env_vars({}) == frozenset({"PROTON_PASS_PERSONAL_ACCESS_TOKEN"})
     assert source.shape == "bulk"
+    assert source.api_version == 1
 
 
 def test_happy_path_one_bulk_read_and_minimal_noninteractive_env(source, configured, tmp_path):
@@ -330,6 +348,7 @@ def test_supported_mapping_is_sorted_and_trashed_items_are_ignored(source, confi
         {},
         {"items": {}},
         {"items": [None]},
+        {"items": [{}]},
         {"items": [{"state": 1}]},
         {"items": [{"state": "Active", "content": None}]},
     ],
@@ -427,7 +446,7 @@ def test_timeout_and_nonzero_errors_are_mapped_without_diagnostics(source, confi
     cfg["command_timeout_seconds"] = 1
     configure(sleep_command="", list_rc=8)
     failed = source.fetch(cfg, other_home)
-    assert failed.error_kind == ErrorKind.AUTH_FAILED
+    assert failed.error_kind == ErrorKind.INTERNAL
     assert "sensitive fake" not in (failed.error or "")
 
 
@@ -474,12 +493,349 @@ def test_orchestrator_protects_bootstrap_token(
     from agent.secret_sources import registry
 
     cfg, configure, _ = configured
-    configure(payload={"items": [login_item("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "vault-copy")]})
+    configure(payload={"items": [login_item("SAFE_RUNTIME_VALUE", "vault-copy")]})
     registry._reset_registry_for_tests()
     monkeypatch.setattr(registry, "_ensure_builtin_sources", lambda: None)
     assert registry.register_source(source)
     env = {"PROTON_PASS_PERSONAL_ACCESS_TOKEN": "bootstrap"}
     report = registry.apply_all({"proton_pass": cfg}, tmp_path, environ=env)
     assert env["PROTON_PASS_PERSONAL_ACCESS_TOKEN"] == "bootstrap"  # noqa: S105
-    assert report.sources[0].skipped_protected == ["PROTON_PASS_PERSONAL_ACCESS_TOKEN"]
+    assert env["SAFE_RUNTIME_VALUE"] == "vault-copy"  # noqa: S105
+    assert source.protected_env_vars(cfg) == frozenset({"PROTON_PASS_PERSONAL_ACCESS_TOKEN"})
+    assert report.sources[0].skipped_protected == []
     registry._reset_registry_for_tests()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "PATH",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "NODE_OPTIONS",
+        "RUBYOPT",
+        "PERL5OPT",
+        "BASH_ENV",
+        "ENV",
+        "ZDOTDIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+        "DYLD_INSERT_LIBRARIES",
+        "HERMES_CONFIG",
+        "PROTON_PASS_SESSION_DIR",
+    ],
+)
+def test_runtime_control_destination_names_are_rejected(plugin_module, name):
+    with pytest.raises(ValueError, match="reserved runtime-control"):
+        plugin_module._parse_items(json.dumps({"items": [login_item(name, "value")]}))
+
+
+def test_hostile_name_after_valid_item_fails_atomically_without_cache(source, configured, tmp_path):
+    cfg, configure, _ = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(
+        payload={
+            "items": [
+                login_item("SAFE_NAME", "safe", item_id="1"),
+                login_item("PATH", "hostile", item_id="2"),
+            ]
+        }
+    )
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert result.secrets == {}
+    assert not (tmp_path / "cache" / "proton_pass_cache.json").exists()
+
+
+def test_unknown_state_after_valid_item_fails_atomically_without_cache(
+    source, configured, tmp_path
+):
+    cfg, configure, _ = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(
+        payload={
+            "items": [
+                login_item("SAFE_NAME", "safe", item_id="1"),
+                login_item("UNKNOWN", "value", item_id="2", state="Deleted"),
+            ]
+        }
+    )
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert result.secrets == {}
+    assert not (tmp_path / "cache" / "proton_pass_cache.json").exists()
+
+
+@pytest.mark.parametrize("setting", ["command_timeout_seconds", "cache_ttl_seconds"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), "nan", "inf"])
+def test_nonfinite_config_is_rejected(source, configured, tmp_path, setting, value):
+    cfg, _, logs = configured
+    cfg[setting] = value
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.NOT_CONFIGURED
+    assert not result.secrets
+    assert logs() == []
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_fetch_budget_rejects_nonfinite_values_with_finite_default(source, value):
+    budget = source.fetch_timeout_seconds({"command_timeout_seconds": value})
+    assert budget == source.fetch_timeout_seconds({"command_timeout_seconds": 30})
+    assert budget < float("inf")
+
+
+def test_not_configured_remediation_uses_plugin_keys(source):
+    remediation = source.remediation(ErrorKind.NOT_CONFIGURED, {})
+    assert "secrets.proton_pass.vault" in remediation
+    assert "PROTON_PASS_PERSONAL_ACCESS_TOKEN" in remediation
+    assert "ProtonPass" not in remediation
+
+
+def test_inherited_path_is_not_used_for_discovery(plugin_module, source, monkeypatch, tmp_path):
+    hostile = tmp_path / "hostile-bin"
+    hostile.mkdir()
+    binary = hostile / ("pass-cli.exe" if os.name == "nt" else "pass-cli")
+    binary.write_bytes(b"hostile")
+    binary.chmod(0o700)
+    monkeypatch.setenv("PATH", str(hostile))
+    monkeypatch.setenv("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake")
+    monkeypatch.setattr(plugin_module, "_standard_binary_candidates", lambda: ())
+    result = source.fetch({"enabled": True, "vault": "v", "binary_path": ""}, tmp_path)
+    assert result.error_kind == ErrorKind.BINARY_MISSING
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and mode policy")
+def test_binary_validator_rejects_insecure_file_and_ancestor(plugin_module):
+    repository = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory(dir=repository) as temporary:
+        root = Path(temporary)
+        insecure_file = root / "insecure-file"
+        insecure_file.write_bytes(b"fake")
+        insecure_file.chmod(0o720)
+        assert plugin_module._validate_binary_path(insecure_file) is None
+
+        insecure_parent = root / "insecure-parent"
+        insecure_parent.mkdir(mode=0o700)
+        candidate = insecure_parent / "pass-cli"
+        candidate.write_bytes(b"fake")
+        candidate.chmod(0o700)
+        insecure_parent.chmod(0o770)
+        assert plugin_module._validate_binary_path(candidate) is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="ordinary Windows users cannot create symlinks")
+def test_binary_validator_accepts_safe_symlink_to_trusted_target(plugin_module):
+    repository = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory(dir=repository) as temporary:
+        root = Path(temporary)
+        target = root / "pass-cli-target"
+        target.write_bytes(b"fake")
+        target.chmod(0o700)
+        link = root / "pass-cli"
+        link.symlink_to(target)
+        assert plugin_module._validate_binary_path(link) == target.resolve()
+
+
+def test_untrusted_product_version_never_receives_token(source, configured, tmp_path):
+    cfg, configure, logs = configured
+    configure(version="Unrelated CLI 9.9.9")
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.BINARY_MISSING
+    assert [entry["argv"] for entry in logs()] == [["--version"]]
+    assert logs()[0]["token_present"] is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="ordinary Windows users cannot create symlinks")
+@pytest.mark.parametrize("name", ["runtime.lock", "session-fingerprint.json"])
+def test_symlinked_state_files_fail_before_cli(source, configured, tmp_path, name):
+    cfg, _, logs = configured
+    root = tmp_path / "state" / "proton-pass"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside-file"
+    outside.write_text("outside", encoding="utf-8")
+    (root / name).symlink_to(outside)
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert result.secrets == {}
+    assert logs() == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="ordinary Windows users cannot create symlinks")
+def test_symlinked_profile_root_fails_before_cli(source, configured, tmp_path):
+    cfg, _, logs = configured
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    profile = tmp_path / "profile-link"
+    profile.symlink_to(outside, target_is_directory=True)
+    result = source.fetch(cfg, profile)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert logs() == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="ordinary Windows users cannot create symlinks")
+def test_symlinked_session_directory_fails_before_cli(source, configured, tmp_path):
+    cfg, _, logs = configured
+    root = tmp_path / "state" / "proton-pass"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside-session"
+    outside.mkdir()
+    (root / "session").symlink_to(outside, target_is_directory=True)
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert logs() == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="ordinary Windows users cannot create symlinks")
+@pytest.mark.parametrize("link_file", [False, True])
+def test_symlinked_cache_parent_or_file_fails_closed(source, configured, tmp_path, link_file):
+    cfg, configure, logs = configured
+    cfg["cache_ttl_seconds"] = 60
+    outside = tmp_path / "outside-cache"
+    outside.mkdir()
+    cache_dir = tmp_path / "cache"
+    if link_file:
+        cache_dir.mkdir()
+        target = outside / "cache.json"
+        target.write_text("{}", encoding="utf-8")
+        (cache_dir / "proton_pass_cache.json").symlink_to(target)
+    else:
+        cache_dir.symlink_to(outside, target_is_directory=True)
+    configure(payload={"items": [login_item()]})
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert result.secrets == {}
+    assert not any(entry["argv"][:2] == ["item", "list"] for entry in logs())
+
+
+def test_same_name_session_tree_replacement_reauthenticates(source, configured, tmp_path):
+    cfg, _, logs = configured
+    assert source.fetch(cfg, tmp_path).ok
+    marker = tmp_path / "state" / "proton-pass" / "session" / "fake-login"
+    marker.write_text("replacement-session", encoding="utf-8")
+    assert source.fetch(cfg, tmp_path).ok
+    assert sum(entry["argv"] == ["login"] for entry in logs()) == 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["malformed_member", "missing_sentinel", "malformed_sentinel", "altered_value"],
+)
+def test_cache_integrity_failures_are_total_misses(source, configured, tmp_path, mutation):
+    cfg, configure, logs = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(payload={"items": [login_item(value="first-value")]})
+    assert source.fetch(cfg, tmp_path).secrets == {"OPENAI_API_KEY": "first-value"}
+    cache = tmp_path / "cache" / "proton_pass_cache.json"
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    sentinel = next(name for name in payload["secrets"] if name.startswith("\0"))
+    if mutation == "malformed_member":
+        payload["secrets"]["OPENAI_API_KEY"] = 7
+    elif mutation == "missing_sentinel":
+        del payload["secrets"][sentinel]
+    elif mutation == "malformed_sentinel":
+        payload["secrets"][sentinel] = 7
+    else:
+        payload["secrets"]["OPENAI_API_KEY"] = "tampered-value"
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+
+    configure(payload={"items": [login_item(value="fresh-value")]})
+    result = source.fetch(cfg, tmp_path)
+    assert result.secrets == {"OPENAI_API_KEY": "fresh-value"}
+    assert sum(entry["argv"][:2] == ["item", "list"] for entry in logs()) == 2
+
+
+def test_ttl_zero_clears_preexisting_plaintext_before_fetch(source, configured, tmp_path):
+    cfg, configure, _ = configured
+    cache = tmp_path / "cache" / "proton_pass_cache.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text('{"old":"plaintext"}', encoding="utf-8")
+    configure(
+        payload={"items": [login_item()]},
+        assert_cache_absent=cache,
+    )
+    assert source.fetch(cfg, tmp_path).ok
+    assert not cache.exists()
+
+
+def test_rotation_clears_old_cache_before_replacement(source, configured, monkeypatch, tmp_path):
+    cfg, configure, _ = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(payload={"items": [login_item(value="old-value")]})
+    assert source.fetch(cfg, tmp_path).ok
+    cache = tmp_path / "cache" / "proton_pass_cache.json"
+    assert cache.exists()
+    monkeypatch.setenv("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "rotated-token")
+    configure(
+        payload={"items": [login_item(value="new-value")]},
+        assert_cache_absent=cache,
+    )
+    result = source.fetch(cfg, tmp_path)
+    assert result.secrets == {"OPENAI_API_KEY": "new-value"}
+
+
+def test_oversized_captured_output_is_rejected_without_cache(
+    plugin_module, source, configured, monkeypatch, tmp_path
+):
+    cfg, configure, _ = configured
+    cfg["cache_ttl_seconds"] = 60
+    monkeypatch.setattr(plugin_module, "_MAX_OUTPUT_BYTES", 32)
+    configure(payload={"items": [login_item(value="long-value")]})
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert not (tmp_path / "cache" / "proton_pass_cache.json").exists()
+
+
+def test_decoded_item_limit_is_rejected_without_cache(
+    plugin_module, source, configured, monkeypatch, tmp_path
+):
+    cfg, configure, _ = configured
+    cfg["cache_ttl_seconds"] = 60
+    monkeypatch.setattr(plugin_module, "_MAX_ITEMS", 1)
+    configure(payload={"items": [login_item(item_id="1"), login_item("OTHER", item_id="2")]})
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert not (tmp_path / "cache" / "proton_pass_cache.json").exists()
+
+
+def test_decoded_field_limit_is_rejected_without_cache(
+    plugin_module, source, configured, monkeypatch, tmp_path
+):
+    cfg, configure, _ = configured
+    cfg["cache_ttl_seconds"] = 60
+    monkeypatch.setattr(plugin_module, "_MAX_FIELDS", 1)
+    configure(
+        payload={
+            "items": [
+                custom_item(
+                    {"name": "ONE", "content": {"Text": "one"}},
+                    {"name": "TWO", "content": {"Text": "two"}},
+                )
+            ]
+        }
+    )
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert not (tmp_path / "cache" / "proton_pass_cache.json").exists()
+
+
+@pytest.mark.parametrize("limit_name", ["name", "value"])
+def test_decoded_name_and_value_limits_are_rejected_without_cache(
+    plugin_module, source, configured, monkeypatch, tmp_path, limit_name
+):
+    cfg, configure, _ = configured
+    cfg["cache_ttl_seconds"] = 60
+    if limit_name == "name":
+        monkeypatch.setattr(plugin_module, "_MAX_NAME_CHARS", 3)
+        item = login_item("LONG_NAME", "ok")
+    else:
+        monkeypatch.setattr(plugin_module, "_MAX_VALUE_CHARS", 3)
+        item = login_item("KEY", "long-value")
+    configure(payload={"items": [item]})
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.INTERNAL
+    assert not (tmp_path / "cache" / "proton_pass_cache.json").exists()

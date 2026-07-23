@@ -83,5 +83,11 @@ def test_clean_temp_home_plugin_discovery_and_secret_registration(tmp_path, monk
         for path in destination.rglob("*")
         if path.is_file() and "__pycache__" not in path.parts
     }
-    assert artifact_files == {"README.md", "after-install.md", "plugin.yaml", "__init__.py"}
+    assert artifact_files == {
+        "CHANGELOG.md",
+        "README.md",
+        "after-install.md",
+        "plugin.yaml",
+        "__init__.py",
+    }
     registry._reset_registry_for_tests()
