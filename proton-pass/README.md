@@ -42,8 +42,8 @@ secrets:
     enabled: true
     vault: "Hermes Runtime"
     binary_path: ""              # empty: fixed standard-location discovery
-    command_timeout_seconds: 30
-    cache_ttl_seconds: 0          # default: no plaintext secret-value cache
+    command_timeout_seconds: 30   # finite, positive, maximum 300 seconds
+    cache_ttl_seconds: 0          # 0 disables caching; maximum 2,592,000 seconds
     override_existing: false      # opt in only if vault values should overwrite env
 ```
 
@@ -92,13 +92,20 @@ duplicate names, malformed active item structures, malformed JSON, partial
 output, or configured structural-size limits reject the **entire** fetch.
 Values are never logged.
 
-Runtime-control destinations are always reserved and reject the entire fetch:
-`PATH`, `PYTHONPATH`, `PYTHONHOME`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
-`NODE_OPTIONS`, `RUBYOPT`, `PERL5OPT`, `BASH_ENV`, `ENV`, `ZDOTDIR`,
-`SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
-`NODE_EXTRA_CA_CERTS`, and every name beginning with `DYLD_`, `HERMES_`, or
-`PROTON_PASS_`. This denylist prevents vault fields from changing execution,
-runtime loading, trust stores, or Hermes/Proton control state.
+Runtime-control destinations are compared case-insensitively against a
+conservative denylist and reject the entire fetch. Categories include process
+and shell controls (`PATH`, `SHELL`, `COMSPEC`, `PATHEXT`), loader and language
+runtime controls (`LD_*`, `DYLD_*`, `PYTHON*`, `NODE_*`, `RUBY*`, `PERL*`, Java
+option variables), VCS/SSH controls (`GIT_*`, `HG*`, `SVN_*`, `P4*`, `SSH_*`),
+proxies and network trust, config/home/temp paths (`XDG_*`, `HOME`, `TMP*`),
+package managers, and OpenSSL, curl, wget, Docker, Kubernetes, Hermes, and
+Proton Pass controls.
+Examples rejected in any letter case include `GIT_SSH_COMMAND`, `SSH_ASKPASS`,
+`JAVA_TOOL_OPTIONS`, `ALL_PROXY`, `XDG_CONFIG_HOME`, `NPM_CONFIG_PREFIX`,
+`OPENSSL_CONF`, `DOCKER_HOST`, and `KUBECONFIG`. This is a defense-in-depth
+control list, not a claim to enumerate every environment variable interpreted
+by every executable. Ordinary secret destinations such as `AWS_ACCESS_KEY_ID`,
+`OPENAI_API_KEY`, and `DATABASE_URL` remain supported.
 
 ## Session and cache security
 
@@ -111,17 +118,24 @@ fresh login in the owned session. Agent and human identity structures fail
 closed. Existing profile, state, session, lock, fingerprint, and cache path
 components are checked without following symlinks. Session reset first
 atomically renames the owned session directory before deleting the retired
-tree.
+tree. Session binding inspects at most 1,024 tree entries and 64 MiB of regular
+file data; exceeding either limit fails the fetch before an unbounded walk or
+file read.
 
 `cache_ttl_seconds: 0` disables secret-value caching. A positive value opts in
 to Hermes' shared plaintext `DiskCache`, stored at
 `<HERMES_HOME>/cache/proton_pass_cache.json` with the framework's atomic-write
 and POSIX permission semantics. Version and identity checks still occur before
-a cache read. An integrity envelope binds all returned names and values to the
-cache context; a missing, malformed, altered, expired, or mismatched entry is a
-total miss and the old cache file is removed before refetching. TTL zero also
-removes this plugin's existing cache before every fetch. Treat that cache as a
-secret store on every platform.
+a cache read. Before calling `DiskCache.read`, the plugin opens the raw cache
+without following a final symlink where the platform supports `O_NOFOLLOW` and
+strictly validates JSON structure, duplicate keys, all secret member types,
+the exact serialized cache key, and a finite positive timestamp no more than
+five seconds in the future and still within the configured TTL. The integrity
+envelope binds all returned names, values, and `fetched_at` to the cache
+context. A missing, malformed, altered, expired, future-dated, or mismatched
+entry is a total miss and the old cache file is removed before one fresh bulk
+read. TTL zero also removes this plugin's existing cache before every fetch.
+Treat that cache as a secret store on every platform.
 
 When disabling or uninstalling the plugin, revoke its PAT and manually remove
 `<HERMES_HOME>/cache/proton_pass_cache.json` and
@@ -138,7 +152,11 @@ Viewer access on only the runtime vault is an operator provisioning step.
 Hermes' required `run_secret_cli` helper captures command output before it
 returns, so this plugin cannot enforce a true streaming output cap. It applies
 a conservative post-capture byte limit and decoded item, field, name, and value
-limits before parsing results into the cache. Filesystem checks use `lstat`,
+limits before parsing results into the cache. `command_timeout_seconds` is
+explicitly bounded at 300 seconds, so the host fetch budget is finite and at
+most 1,815 seconds; `cache_ttl_seconds` is bounded at 2,592,000 seconds (30
+days). Values above either limit, including huge finite values, are rejected
+before CLI execution. Filesystem checks use `lstat`,
 `O_NOFOLLOW` where available, canonical executable targets, and atomic rename,
 but cannot eliminate all check/use races. Windows reparse points and ACLs do
 not receive a publisher/DACL guarantee here; Windows operators should install

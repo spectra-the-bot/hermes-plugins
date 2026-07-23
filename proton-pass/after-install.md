@@ -10,4 +10,5 @@
    Hermes `.env` if it was not entered during installation.
 5. Restart Hermes. Vault values do not override existing environment values by
    default. See the plugin README for mapping, reserved names, cache cleanup,
-   and platform limitations.
+   and platform limitations. Command timeouts must not exceed 300 seconds;
+   plaintext cache TTL is disabled by default and must not exceed 30 days.

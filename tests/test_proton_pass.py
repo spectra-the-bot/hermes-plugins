@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -218,6 +219,8 @@ def test_missing_and_pinned_binary_errors(source, monkeypatch, tmp_path):
 def test_config_schema_and_bootstrap_protection(source):
     schema = source.config_schema()
     assert schema["cache_ttl_seconds"]["default"] == 0
+    assert schema["cache_ttl_seconds"]["maximum"] == 30 * 24 * 60 * 60
+    assert schema["command_timeout_seconds"]["maximum"] == 300
     assert schema["binary_path"]["default"] == ""
     assert schema["override_existing"]["default"] is False
     assert source.override_existing({}) is False
@@ -509,30 +512,69 @@ def test_orchestrator_protects_bootstrap_token(
 @pytest.mark.parametrize(
     "name",
     [
-        "PATH",
-        "PYTHONPATH",
-        "PYTHONHOME",
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "NODE_OPTIONS",
-        "RUBYOPT",
-        "PERL5OPT",
-        "BASH_ENV",
-        "ENV",
-        "ZDOTDIR",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "REQUESTS_CA_BUNDLE",
-        "CURL_CA_BUNDLE",
-        "NODE_EXTRA_CA_CERTS",
-        "DYLD_INSERT_LIBRARIES",
-        "HERMES_CONFIG",
-        "PROTON_PASS_SESSION_DIR",
+        "Path",
+        "pythonPath",
+        "ld_preload",
+        "DyLd_Insert_Libraries",
+        "git_Ssh_Command",
+        "Ssh_AskPass",
+        "HgRcPath",
+        "Svn_Editor",
+        "P4Config",
+        "java_tool_options",
+        "_JaVa_OpTiOnS",
+        "all_proxy",
+        "https_proxy",
+        "ComSpec",
+        "PathExt",
+        "xdg_config_home",
+        "Hermes_Config",
+        "proton_pass_session_dir",
+        "npm_config_prefix",
+        "Yarn_Cache_Folder",
+        "OpenSSL_Conf",
+        "Curl_Home",
+        "WgetRc",
+        "Docker_Host",
+        "KubeConfig",
+        "Home",
+        "TmpDir",
+        "Shell",
+        "Editor",
+        "Pager",
     ],
 )
 def test_runtime_control_destination_names_are_rejected(plugin_module, name):
     with pytest.raises(ValueError, match="reserved runtime-control"):
         plugin_module._parse_items(json.dumps({"items": [login_item(name, "value")]}))
+
+
+@pytest.mark.parametrize(
+    "name", ["AWS_ACCESS_KEY_ID", "OPENAI_API_KEY", "DATABASE_URL", "some_service_token"]
+)
+def test_ordinary_api_secret_destinations_remain_supported(plugin_module, name):
+    assert plugin_module._parse_items(json.dumps({"items": [login_item(name, "value")]})) == {
+        name: "value"
+    }
+
+
+@pytest.mark.parametrize("override_existing", [False, True])
+def test_orchestrator_never_applies_git_ssh_command(
+    source, configured, tmp_path, monkeypatch, override_existing
+):
+    from agent.secret_sources import registry
+
+    cfg, configure, _ = configured
+    cfg["override_existing"] = override_existing
+    configure(payload={"items": [login_item("GIT_SSH_COMMAND", "fake-executable")]})
+    registry._reset_registry_for_tests()
+    monkeypatch.setattr(registry, "_ensure_builtin_sources", lambda: None)
+    assert registry.register_source(source)
+    env: dict[str, str] = {}
+    report = registry.apply_all({"proton_pass": cfg}, tmp_path, environ=env)
+    assert "GIT_SSH_COMMAND" not in env
+    assert report.sources[0].result.error_kind == ErrorKind.INTERNAL
+    registry._reset_registry_for_tests()
 
 
 def test_hostile_name_after_valid_item_fails_atomically_without_cache(source, configured, tmp_path):
@@ -582,9 +624,26 @@ def test_nonfinite_config_is_rejected(source, configured, tmp_path, setting, val
     assert logs() == []
 
 
+@pytest.mark.parametrize("setting", ["command_timeout_seconds", "cache_ttl_seconds"])
+@pytest.mark.parametrize("value", [1e308, 10**1000])
+def test_huge_finite_config_is_rejected(source, configured, tmp_path, setting, value):
+    cfg, _, logs = configured
+    cfg[setting] = value
+    result = source.fetch(cfg, tmp_path)
+    assert result.error_kind == ErrorKind.NOT_CONFIGURED
+    assert not result.secrets
+    assert logs() == []
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_fetch_budget_rejects_nonfinite_values_with_finite_default(source, value):
     budget = source.fetch_timeout_seconds({"command_timeout_seconds": value})
+    assert budget == source.fetch_timeout_seconds({"command_timeout_seconds": 30})
+    assert budget < float("inf")
+
+
+def test_fetch_budget_rejects_huge_finite_value_with_finite_default(source):
+    budget = source.fetch_timeout_seconds({"command_timeout_seconds": 1e308})
     assert budget == source.fetch_timeout_seconds({"command_timeout_seconds": 30})
     assert budget < float("inf")
 
@@ -721,6 +780,25 @@ def test_same_name_session_tree_replacement_reauthenticates(source, configured, 
     assert sum(entry["argv"] == ["login"] for entry in logs()) == 2
 
 
+def test_session_tree_entry_limit_fails_before_unbounded_walk(plugin_module, tmp_path, monkeypatch):
+    session = tmp_path / "session"
+    session.mkdir()
+    for index in range(3):
+        (session / f"entry-{index}").write_bytes(b"x")
+    monkeypatch.setattr(plugin_module, "_MAX_SESSION_ENTRIES", 2)
+    with pytest.raises(RuntimeError, match="entry limit"):
+        plugin_module._session_tree_digest(session)
+
+
+def test_session_tree_byte_limit_rejects_small_fixture(plugin_module, tmp_path, monkeypatch):
+    session = tmp_path / "session"
+    session.mkdir()
+    (session / "oversized").write_bytes(b"12345")
+    monkeypatch.setattr(plugin_module, "_MAX_SESSION_FILE_BYTES", 4)
+    with pytest.raises(RuntimeError, match="byte limit"):
+        plugin_module._session_tree_digest(session)
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["malformed_member", "missing_sentinel", "malformed_sentinel", "altered_value"],
@@ -746,6 +824,93 @@ def test_cache_integrity_failures_are_total_misses(source, configured, tmp_path,
     configure(payload={"items": [login_item(value="fresh-value")]})
     result = source.fetch(cfg, tmp_path)
     assert result.secrets == {"OPENAI_API_KEY": "fresh-value"}
+    assert sum(entry["argv"][:2] == ["item", "list"] for entry in logs()) == 2
+
+
+def _rewrite_cache(cache: Path, transform) -> None:
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    transform(payload)
+    cache.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_malformed_extra_cache_member_disk_cache_would_drop_is_total_miss(
+    source, configured, tmp_path, plugin_module, monkeypatch
+):
+    cfg, configure, logs = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(payload={"items": [login_item(value="first-value")]})
+    assert source.fetch(cfg, tmp_path).ok
+    cache = tmp_path / "cache" / "proton_pass_cache.json"
+    _rewrite_cache(cache, lambda payload: payload["secrets"].update({"EXTRA": 7}))
+    monkeypatch.setattr(
+        plugin_module._DISK_CACHE,
+        "read",
+        lambda *args, **kwargs: pytest.fail("DiskCache.read ran before raw validation"),
+    )
+    configure(payload={"items": [login_item(value="fresh-value")]})
+    assert source.fetch(cfg, tmp_path).secrets == {"OPENAI_API_KEY": "fresh-value"}
+    assert sum(entry["argv"][:2] == ["item", "list"] for entry in logs()) == 2
+
+
+def test_extra_top_level_cache_key_is_total_miss(source, configured, tmp_path):
+    cfg, configure, logs = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(payload={"items": [login_item(value="first-value")]})
+    assert source.fetch(cfg, tmp_path).ok
+    cache = tmp_path / "cache" / "proton_pass_cache.json"
+    _rewrite_cache(cache, lambda payload: payload.update({"unexpected": "member"}))
+    configure(payload={"items": [login_item(value="fresh-value")]})
+    assert source.fetch(cfg, tmp_path).secrets == {"OPENAI_API_KEY": "fresh-value"}
+    assert sum(entry["argv"][:2] == ["item", "list"] for entry in logs()) == 2
+
+
+def test_duplicate_cache_keys_are_total_miss(source, configured, tmp_path):
+    cfg, configure, logs = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(payload={"items": [login_item(value="first-value")]})
+    assert source.fetch(cfg, tmp_path).ok
+    cache = tmp_path / "cache" / "proton_pass_cache.json"
+    raw = cache.read_text(encoding="utf-8")
+    cache.write_text(raw.replace('{"key":', '{"key":"duplicate","key":', 1), encoding="utf-8")
+    configure(payload={"items": [login_item(value="fresh-value")]})
+    assert source.fetch(cfg, tmp_path).secrets == {"OPENAI_API_KEY": "fresh-value"}
+    assert sum(entry["argv"][:2] == ["item", "list"] for entry in logs()) == 2
+
+
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_cache_timestamp_is_total_miss(source, configured, tmp_path, timestamp):
+    cfg, configure, logs = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(payload={"items": [login_item(value="first-value")]})
+    assert source.fetch(cfg, tmp_path).ok
+    cache = tmp_path / "cache" / "proton_pass_cache.json"
+    _rewrite_cache(cache, lambda payload: payload.update({"fetched_at": timestamp}))
+    configure(payload={"items": [login_item(value="fresh-value")]})
+    assert source.fetch(cfg, tmp_path).secrets == {"OPENAI_API_KEY": "fresh-value"}
+    assert sum(entry["argv"][:2] == ["item", "list"] for entry in logs()) == 2
+
+
+def test_future_cache_timestamp_is_total_miss(source, configured, tmp_path):
+    cfg, configure, logs = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(payload={"items": [login_item(value="first-value")]})
+    assert source.fetch(cfg, tmp_path).ok
+    cache = tmp_path / "cache" / "proton_pass_cache.json"
+    _rewrite_cache(cache, lambda payload: payload.update({"fetched_at": time.time() + 3600}))
+    configure(payload={"items": [login_item(value="fresh-value")]})
+    assert source.fetch(cfg, tmp_path).secrets == {"OPENAI_API_KEY": "fresh-value"}
+    assert sum(entry["argv"][:2] == ["item", "list"] for entry in logs()) == 2
+
+
+def test_altered_cache_timestamp_breaks_integrity_envelope(source, configured, tmp_path):
+    cfg, configure, logs = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(payload={"items": [login_item(value="first-value")]})
+    assert source.fetch(cfg, tmp_path).ok
+    cache = tmp_path / "cache" / "proton_pass_cache.json"
+    _rewrite_cache(cache, lambda payload: payload.update({"fetched_at": payload["fetched_at"] - 1}))
+    configure(payload={"items": [login_item(value="fresh-value")]})
+    assert source.fetch(cfg, tmp_path).secrets == {"OPENAI_API_KEY": "fresh-value"}
     assert sum(entry["argv"][:2] == ["item", "list"] for entry in logs()) == 2
 
 

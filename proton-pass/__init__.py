@@ -35,6 +35,10 @@ from agent.secret_sources.base import (
 TOKEN_ENV = "PROTON_PASS_PERSONAL_ACCESS_TOKEN"  # noqa: S105  # nosec B105
 _MIN_VERSION = (2, 1, 0)
 _DEFAULT_TIMEOUT = 30.0
+_MAX_COMMAND_TIMEOUT_SECONDS = 300.0
+_MAX_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
+_MAX_FETCH_TIMEOUT_SECONDS = _MAX_COMMAND_TIMEOUT_SECONDS * 6 + 15
+_CACHE_FUTURE_SKEW_SECONDS = 5.0
 _CACHE_FORMAT = "proton-pass-runtime-v1"
 _PRIVILEGE_MODE = "read-only-vault"
 _VERSION_RE = re.compile(r"^Proton Pass CLI (\d+)\.(\d+)\.(\d+)(?: \([^\r\n()]+\))?\s*$")
@@ -45,27 +49,94 @@ _MAX_ITEMS = 10_000
 _MAX_FIELDS = 50_000
 _MAX_NAME_CHARS = 256
 _MAX_VALUE_CHARS = 1024 * 1024
+_MAX_SESSION_ENTRIES = 1024
+_MAX_SESSION_FILE_BYTES = 64 * 1024 * 1024
 _BLOCKED_ENV_NAMES = frozenset(
     {
+        # Process launch, shells, config locations, temporary paths, and Windows controls.
         "PATH",
-        "PYTHONPATH",
-        "PYTHONHOME",
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "NODE_OPTIONS",
-        "RUBYOPT",
-        "PERL5OPT",
+        "CDPATH",
         "BASH_ENV",
         "ENV",
         "ZDOTDIR",
+        "SHELL",
+        "IFS",
+        "PS4",
+        "HOME",
+        "USERPROFILE",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+        "MANPAGER",
+        "LESS",
+        "PROMPT",
+        "PSMODULEPATH",
+        # Proxy and network trust controls.
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
         "REQUESTS_CA_BUNDLE",
-        "CURL_CA_BUNDLE",
         "NODE_EXTRA_CA_CERTS",
+        "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+        # Version-control client controls not covered by prefixes below.
+        "CVS_RSH",
+        "HGRCPATH",
+        # Runtime and package/tool configuration controls not covered by prefixes below.
+        "_JAVA_OPTIONS",
+        "JAVA_TOOL_OPTIONS",
+        "JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "JAVA_HOME",
+        "CLASSPATH",
+        "VIRTUAL_ENV",
+        "KUBECONFIG",
+        "WGETRC",
     }
 )
-_BLOCKED_ENV_PREFIXES = ("DYLD_", "HERMES_", "PROTON_PASS_")
+_BLOCKED_ENV_PREFIXES = (
+    "GIT_",
+    "SSH_",
+    "HG",
+    "SVN_",
+    "P4",
+    "XDG_",
+    "LD_",
+    "DYLD_",
+    "HERMES_",
+    "PROTON_PASS_",
+    "PYTHON",
+    "NODE_",
+    "RUBY",
+    "PERL",
+    "NPM_CONFIG_",
+    "YARN_",
+    "PNPM_",
+    "PIP_",
+    "POETRY_",
+    "UV_",
+    "BUNDLE_",
+    "GEM_",
+    "CARGO_",
+    "RUSTUP_",
+    "CONDA_",
+    "OPENSSL_",
+    "CURL_",
+    "WGET_",
+    "DOCKER_",
+)
 
 
 class _Paths(NamedTuple):
@@ -84,6 +155,11 @@ class _SessionBinding(NamedTuple):
     identity_name: str
 
 
+class _RawCacheEntry(NamedTuple):
+    secrets: dict[str, str]
+    fetched_at: float
+
+
 def _cache_key_string(key: _CacheKey) -> str:
     return "|".join(key)
 
@@ -97,12 +173,18 @@ def _result_error(message: str, kind: ErrorKind, binary: Path | None = None) -> 
     return FetchResult(error=message, error_kind=kind, binary_path=binary)
 
 
-def _parse_positive_float(value: Any, default: float, *, allow_zero: bool = False) -> float:
+def _parse_positive_float(
+    value: Any,
+    default: float,
+    *,
+    maximum: float,
+    allow_zero: bool = False,
+) -> float:
     try:
         parsed = float(value)
     except (OverflowError, TypeError, ValueError):
         return default
-    if math.isfinite(parsed) and (parsed > 0 or (allow_zero and parsed == 0)):
+    if math.isfinite(parsed) and parsed <= maximum and (parsed > 0 or (allow_zero and parsed == 0)):
         return parsed
     return default
 
@@ -114,6 +196,21 @@ def _is_nonfinite_number(value: Any) -> bool:
         return True
     except (TypeError, ValueError):
         return False
+
+
+def _exceeds_finite_bound(value: Any, maximum: float) -> bool:
+    try:
+        parsed = float(value)
+    except OverflowError:
+        return True
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(parsed) and parsed > maximum
+
+
+def _is_blocked_env_name(name: str) -> bool:
+    normalized = name.upper()
+    return normalized in _BLOCKED_ENV_NAMES or normalized.startswith(_BLOCKED_ENV_PREFIXES)
 
 
 def _standard_binary_candidates() -> tuple[Path, ...]:
@@ -384,10 +481,20 @@ def _session_tree_digest(path: Path) -> str:
     ):
         _hash_component(digest, str(value))
 
+    entry_count = 0
+    total_file_bytes = 0
+
     def visit(directory: Path, relative: Path) -> None:
+        nonlocal entry_count, total_file_bytes
         try:
             with os.scandir(directory) as iterator:
-                entries = sorted(iterator, key=lambda entry: entry.name)
+                entries = []
+                for entry in iterator:
+                    entry_count += 1
+                    if entry_count > _MAX_SESSION_ENTRIES:
+                        raise RuntimeError("Proton Pass session data exceeds the entry limit.")
+                    entries.append(entry)
+                entries.sort(key=lambda entry: entry.name)
         except OSError as exc:
             raise RuntimeError("Could not inspect the isolated Proton Pass session.") from exc
         for entry in entries:
@@ -427,6 +534,11 @@ def _session_tree_digest(path: Path) -> str:
                     metadata.st_ino,
                 ):
                     raise RuntimeError("Proton Pass session data changed while it was inspected.")
+                if opened.st_size > _MAX_SESSION_FILE_BYTES - total_file_bytes:
+                    raise RuntimeError(
+                        "Proton Pass session data exceeds the regular-file byte limit."
+                    )
+                total_file_bytes += opened.st_size
                 _hash_component(digest, "file")
                 _hash_component(digest, relative_name)
                 _hash_component(digest, str(stat.S_IMODE(opened.st_mode)))
@@ -434,10 +546,15 @@ def _session_tree_digest(path: Path) -> str:
                 _hash_component(digest, str(opened.st_ino))
                 _hash_component(digest, str(opened.st_size))
                 _hash_component(digest, str(opened.st_mtime_ns))
+                read_bytes = 0
                 while True:
-                    chunk = os.read(fd, 128 * 1024)
+                    remaining = opened.st_size - read_bytes
+                    chunk = os.read(fd, min(128 * 1024, remaining + 1))
                     if not chunk:
                         break
+                    read_bytes += len(chunk)
+                    if read_bytes > opened.st_size:
+                        raise RuntimeError("Proton Pass session data grew while it was inspected.")
                     digest.update(chunk)
             finally:
                 os.close(fd)
@@ -662,7 +779,7 @@ def _refresh_session_binding(paths: _Paths, token: str, identity_name: str) -> _
 def _add_secret(target: dict[str, str], name: Any, value: Any) -> None:
     if not isinstance(name, str) or len(name) > _MAX_NAME_CHARS or not is_valid_env_name(name):
         raise ValueError("a supported secret field has an invalid environment-variable name")
-    if name in _BLOCKED_ENV_NAMES or name.startswith(_BLOCKED_ENV_PREFIXES):
+    if _is_blocked_env_name(name):
         raise ValueError("a supported field uses a reserved runtime-control destination name")
     if not isinstance(value, str) or value == "":
         raise ValueError("a supported field has an empty or non-string value")
@@ -766,23 +883,99 @@ def _parse_items(stdout: str) -> dict[str, str]:
     return dict(sorted(found.items()))
 
 
-def _cache_integrity(key: _CacheKey, secrets: dict[str, str]) -> str:
+def _reject_json_constant(constant: str) -> Any:
+    raise ValueError(f"non-standard JSON constant {constant!r}")
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in parsed:
+            raise ValueError("duplicate JSON object key")
+        parsed[name] = value
+    return parsed
+
+
+def _validated_raw_cache(
+    path: Path, key: _CacheKey, ttl: float, *, now: float | None = None
+) -> _RawCacheEntry | None:
+    """Validate the lossless cache object before Hermes' normalizing reader sees it."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+    try:
+        handle = os.fdopen(fd, "r", encoding="utf-8")
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        with handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            payload = json.load(
+                handle,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+    if not isinstance(payload, dict) or set(payload) != {"key", "secrets", "fetched_at"}:
+        return None
+    if payload["key"] != _cache_key_string(key):
+        return None
+    raw_secrets = payload["secrets"]
+    if not isinstance(raw_secrets, dict) or not all(
+        isinstance(name, str) and isinstance(value, str) for name, value in raw_secrets.items()
+    ):
+        return None
+    raw_timestamp = payload["fetched_at"]
+    if isinstance(raw_timestamp, bool) or not isinstance(raw_timestamp, (int, float)):
+        return None
+    try:
+        fetched_at = float(raw_timestamp)
+    except (OverflowError, ValueError):
+        return None
+    current_time = time.time() if now is None else now
+    if (
+        not math.isfinite(fetched_at)
+        or fetched_at <= 0
+        or fetched_at > current_time + _CACHE_FUTURE_SKEW_SECONDS
+        or current_time - fetched_at >= ttl
+    ):
+        return None
+    return _RawCacheEntry(dict(raw_secrets), fetched_at)
+
+
+def _cache_integrity(key: _CacheKey, secrets: dict[str, str], fetched_at: float) -> str:
     digest = hashlib.sha256()
-    _hash_component(digest, "proton-pass-cache-envelope-v1")
+    _hash_component(digest, "proton-pass-cache-envelope-v2")
     _hash_component(digest, _cache_key_string(key))
+    _hash_component(digest, fetched_at.hex())
     for name, value in sorted(secrets.items()):
         _hash_component(digest, name)
         _hash_component(digest, value)
     return digest.hexdigest()
 
 
-def _cache_envelope(key: _CacheKey, secrets: dict[str, str]) -> dict[str, str]:
+def _cache_envelope(key: _CacheKey, secrets: dict[str, str], fetched_at: float) -> dict[str, str]:
     envelope = dict(secrets)
-    envelope[_CACHE_SENTINEL] = _cache_integrity(key, secrets)
+    envelope[_CACHE_SENTINEL] = _cache_integrity(key, secrets, fetched_at)
     return envelope
 
 
-def _verified_cached_secrets(key: _CacheKey, cached: CachedFetch) -> dict[str, str] | None:
+def _verified_cached_secrets(
+    key: _CacheKey, cached: CachedFetch, raw: _RawCacheEntry
+) -> dict[str, str] | None:
+    if cached.fetched_at != raw.fetched_at or cached.secrets != raw.secrets:
+        return None
     integrity = cached.secrets.get(_CACHE_SENTINEL)
     if not isinstance(integrity, str) or not re.fullmatch(r"[0-9a-f]{64}", integrity):
         return None
@@ -794,7 +987,8 @@ def _verified_cached_secrets(key: _CacheKey, cached: CachedFetch) -> dict[str, s
             _add_secret(verified, name, value)
     except ValueError:
         return None
-    if not hmac.compare_digest(integrity, _cache_integrity(key, verified)):
+    expected = _cache_integrity(key, verified, cached.fetched_at)
+    if not hmac.compare_digest(integrity, expected):
         return None
     return dict(sorted(verified.items()))
 
@@ -824,10 +1018,12 @@ class ProtonPassSource(SecretSource):
             "command_timeout_seconds": {
                 "description": "Timeout for each noninteractive CLI operation",
                 "default": _DEFAULT_TIMEOUT,
+                "maximum": _MAX_COMMAND_TIMEOUT_SECONDS,
             },
             "cache_ttl_seconds": {
                 "description": "Plaintext DiskCache TTL; 0 disables all secret-value caching",
                 "default": 0,
+                "maximum": _MAX_CACHE_TTL_SECONDS,
             },
             "override_existing": {
                 "description": "Vault values overwrite .env/shell values",
@@ -867,10 +1063,16 @@ class ProtonPassSource(SecretSource):
                 ErrorKind.NOT_CONFIGURED,
             )
 
-        for setting in ("command_timeout_seconds", "cache_ttl_seconds"):
-            if _is_nonfinite_number(cfg.get(setting)):
+        bounded_settings = (
+            ("command_timeout_seconds", _MAX_COMMAND_TIMEOUT_SECONDS),
+            ("cache_ttl_seconds", _MAX_CACHE_TTL_SECONDS),
+        )
+        for setting, maximum in bounded_settings:
+            value = cfg.get(setting)
+            if _is_nonfinite_number(value) or _exceeds_finite_bound(value, maximum):
                 return _result_error(
-                    f"secrets.proton_pass.{setting} must be finite.",
+                    f"secrets.proton_pass.{setting} must be finite and no greater "
+                    f"than {maximum:g}.",
                     ErrorKind.NOT_CONFIGURED,
                 )
 
@@ -897,8 +1099,17 @@ class ProtonPassSource(SecretSource):
                 ErrorKind.BINARY_MISSING,
             )
 
-        timeout = _parse_positive_float(cfg.get("command_timeout_seconds"), _DEFAULT_TIMEOUT)
-        ttl = _parse_positive_float(cfg.get("cache_ttl_seconds"), 0.0, allow_zero=True)
+        timeout = _parse_positive_float(
+            cfg.get("command_timeout_seconds"),
+            _DEFAULT_TIMEOUT,
+            maximum=_MAX_COMMAND_TIMEOUT_SECONDS,
+        )
+        ttl = _parse_positive_float(
+            cfg.get("cache_ttl_seconds"),
+            0.0,
+            maximum=_MAX_CACHE_TTL_SECONDS,
+            allow_zero=True,
+        )
         paths = _paths(home_path)
         try:
             _prepare_paths(paths)
@@ -954,9 +1165,10 @@ class ProtonPassSource(SecretSource):
         cache_key: _CacheKey = (binding.fingerprint, vault, _CACHE_FORMAT)
         if ttl > 0:
             _prepare_cache(home_path, create_parent=False)
-            cached = _DISK_CACHE.read(cache_key, ttl, home_path)
-            if cached is not None:
-                verified = _verified_cached_secrets(cache_key, cached)
+            raw = _validated_raw_cache(_cache_file(home_path), cache_key, ttl)
+            cached = _DISK_CACHE.read(cache_key, ttl, home_path) if raw is not None else None
+            if cached is not None and raw is not None:
+                verified = _verified_cached_secrets(cache_key, cached, raw)
                 if verified is not None:
                     return FetchResult(secrets=verified, binary_path=binary)
             # Expired, mismatched, malformed, and absent envelopes all remove
@@ -1002,9 +1214,13 @@ class ProtonPassSource(SecretSource):
         cache_key = (binding.fingerprint, vault, _CACHE_FORMAT)
         if ttl > 0:
             _prepare_cache(home_path, create_parent=True)
+            fetched_at = time.time()
             _DISK_CACHE.write(
                 cache_key,
-                CachedFetch(secrets=_cache_envelope(cache_key, secrets), fetched_at=time.time()),
+                CachedFetch(
+                    secrets=_cache_envelope(cache_key, secrets, fetched_at),
+                    fetched_at=fetched_at,
+                ),
                 ttl,
                 home_path,
             )
@@ -1028,9 +1244,14 @@ class ProtonPassSource(SecretSource):
     def fetch_timeout_seconds(self, cfg: dict[str, Any]) -> float:
         """Budget for lock contention plus the bounded noninteractive subprocesses."""
         timeout = _parse_positive_float(
-            (cfg or {}).get("command_timeout_seconds"), _DEFAULT_TIMEOUT
+            (cfg or {}).get("command_timeout_seconds"),
+            _DEFAULT_TIMEOUT,
+            maximum=_MAX_COMMAND_TIMEOUT_SECONDS,
         )
-        return max(super().fetch_timeout_seconds(cfg), timeout * 6 + 15)
+        parent_budget = super().fetch_timeout_seconds(cfg)
+        if not math.isfinite(parent_budget) or parent_budget <= 0:
+            parent_budget = 0.0
+        return min(max(parent_budget, timeout * 6 + 15), _MAX_FETCH_TIMEOUT_SECONDS)
 
 
 def register(ctx: Any) -> None:
