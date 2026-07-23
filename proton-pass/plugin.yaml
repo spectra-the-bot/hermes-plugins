@@ -1,0 +1,15 @@
+manifest_version: 1
+name: proton-pass
+version: 1.0.0
+description: "Runtime-only Proton Pass secret source: plain read-only PAT, isolated session, and one bulk fetch."
+author: spectra-the-bot
+kind: backend
+platforms:
+  - linux
+  - macos
+  - windows
+requires_env:
+  - name: PROTON_PASS_PERSONAL_ACCESS_TOKEN
+    description: "Plain narrowly scoped read-only Proton Pass personal access token (Agent tokens are rejected)"
+    url: "https://proton.me/support/pass-cli"
+    secret: true
