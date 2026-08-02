@@ -161,6 +161,26 @@ def source(plugin_module):
     return plugin_module.ProtonPassSource()
 
 
+def test_register_refreshes_secrets_after_source_registration(plugin_module, monkeypatch):
+    """The discovering Hermes process must receive secrets before gateway config loads."""
+    from hermes_cli import env_loader
+
+    calls: list[object] = []
+
+    class FakeContext:
+        def register_secret_source(self, source):
+            calls.append(source)
+
+    monkeypatch.setattr(env_loader, "reset_secret_source_cache", lambda: calls.append("reset"))
+    monkeypatch.setattr(env_loader, "load_hermes_dotenv", lambda: calls.append("refresh"))
+
+    plugin_module.register(FakeContext())
+
+    assert len(calls) == 3
+    assert isinstance(calls[0], plugin_module.ProtonPassSource)
+    assert calls[1:] == ["reset", "refresh"]
+
+
 @pytest.fixture
 def configured(monkeypatch, fake_cli):
     binary, configure, logs = fake_cli
@@ -223,6 +243,7 @@ def test_config_schema_and_bootstrap_protection(source):
     assert schema["command_timeout_seconds"]["maximum"] == 300
     assert schema["binary_path"]["default"] == ""
     assert schema["override_existing"]["default"] is False
+    assert schema["exclude_names"]["default"] == []
     assert source.override_existing({}) is False
     assert source.override_existing({"override_existing": True}) is True
     assert source.protected_env_vars({}) == frozenset({"PROTON_PASS_PERSONAL_ACCESS_TOKEN"})
@@ -379,13 +400,11 @@ def test_partial_json_fails_closed_and_is_not_cached(source, configured, tmp_pat
 @pytest.mark.parametrize(
     "items",
     [
-        [login_item("DUP", "one", item_id="1"), login_item("DUP", "two", item_id="2")],
-        [login_item("1INVALID", "one")],
         [login_item("EMPTY", "")],
         [login_item("NOT_STRING", 7)],
     ],
 )
-def test_duplicate_invalid_and_empty_supported_values_fail_atomically(
+def test_empty_supported_values_fail_atomically(
     source, configured, tmp_path, items
 ):
     cfg, configure, _ = configured
@@ -393,6 +412,66 @@ def test_duplicate_invalid_and_empty_supported_values_fail_atomically(
     result = source.fetch(cfg, tmp_path)
     assert result.error_kind == ErrorKind.INTERNAL
     assert result.secrets == {}
+
+
+def test_duplicate_destination_is_omitted_without_losing_unrelated_secrets(
+    source, configured, tmp_path
+):
+    cfg, configure, _ = configured
+    configure(
+        payload={
+            "items": [
+                login_item("DUP", "one", item_id="1"),
+                login_item("KEEP", "safe", item_id="2"),
+                login_item("DUP", "two", item_id="3"),
+                login_item("DUP", "three", item_id="4"),
+            ]
+        }
+    )
+    result = source.fetch(cfg, tmp_path)
+    assert result.ok
+    assert result.secrets == {"KEEP": "safe"}
+
+
+def test_non_environment_login_titles_and_custom_fields_are_ignored(
+    source, configured, tmp_path
+):
+    cfg, configure, _ = configured
+    configure(
+        payload={
+            "items": [
+                login_item("ordinary website login", "not-exported", item_id="1"),
+                custom_item(
+                    {"name": "API Key", "content": {"Hidden": "not-exported"}},
+                    {"name": "EMPTY_METADATA", "content": {"Text": ""}},
+                    {"name": "VALID_API_KEY", "content": {"Hidden": "exported"}},
+                ),
+            ]
+        }
+    )
+    result = source.fetch(cfg, tmp_path)
+    assert result.ok
+    assert result.secrets == {"VALID_API_KEY": "exported"}
+
+
+def test_explicit_exclusions_apply_to_logins_and_custom_fields(source, configured, tmp_path):
+    cfg, configure, _ = configured
+    cfg["exclude_names"] = ["PROTON_PASS_AGENT_TOKEN", "CUSTOM_SKIP"]
+    configure(
+        payload={
+            "items": [
+                login_item("PROTON_PASS_AGENT_TOKEN", "not-exported", item_id="1"),
+                login_item("KEEP", "safe", item_id="2"),
+                custom_item(
+                    {"name": "CUSTOM_SKIP", "content": {"Hidden": "not-exported"}},
+                    {"name": "not valid", "content": {"Hidden": "not-exported"}},
+                ),
+            ]
+        }
+    )
+    result = source.fetch(cfg, tmp_path)
+    assert result.ok
+    assert result.secrets == {"KEEP": "safe"}
 
 
 def test_valid_empty_vault_response(source, configured, tmp_path):
@@ -434,6 +513,16 @@ def test_cache_is_bound_to_token_fingerprint(source, configured, monkeypatch, tm
     monkeypatch.setenv("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "rotated-fake-token")
     configure(payload={"items": [login_item(value="second-fake-secret")]})
     assert source.fetch(cfg, tmp_path).secrets == {"OPENAI_API_KEY": "second-fake-secret"}
+    assert sum(call["argv"][:2] == ["item", "list"] for call in logs()) == 2
+
+
+def test_cache_is_bound_to_exclusions(source, configured, tmp_path):
+    cfg, configure, logs = configured
+    cfg["cache_ttl_seconds"] = 60
+    configure(payload={"items": [login_item()]})
+    assert source.fetch(cfg, tmp_path).secrets == {"OPENAI_API_KEY": "fake-secret"}
+    cfg["exclude_names"] = ["OPENAI_API_KEY"]
+    assert source.fetch(cfg, tmp_path).secrets == {}
     assert sum(call["argv"][:2] == ["item", "list"] for call in logs()) == 2
 
 
@@ -488,6 +577,13 @@ def test_manifest_register_and_config_errors(plugin_module, source, monkeypatch,
         source.fetch({"enabled": True, "vault": "v", "binary_path": []}, tmp_path).error_kind
         == ErrorKind.NOT_CONFIGURED
     )
+    for invalid in ("NAME", ["not valid"], [7]):
+        assert (
+            source.fetch(
+                {"enabled": True, "vault": "v", "exclude_names": invalid}, tmp_path
+            ).error_kind
+            == ErrorKind.NOT_CONFIGURED
+        )
 
 
 def test_orchestrator_protects_bootstrap_token(

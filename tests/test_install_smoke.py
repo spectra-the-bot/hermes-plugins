@@ -18,7 +18,7 @@ def test_subdirectory_identifier_and_manifest_contract():
 
     manifest = yaml.safe_load((ROOT / "proton-pass" / "plugin.yaml").read_text())
     assert manifest["name"] == "proton-pass"
-    assert manifest["version"] == "1.0.0"
+    assert manifest["version"] == "1.1.0"
     assert manifest["platforms"] == ["linux", "macos", "windows"]
     assert manifest["requires_env"][0]["name"] == "PROTON_PASS_PERSONAL_ACCESS_TOKEN"
     assert manifest["requires_env"][0]["secret"] is True

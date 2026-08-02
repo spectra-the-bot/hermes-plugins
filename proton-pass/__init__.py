@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -31,6 +32,8 @@ from agent.secret_sources.base import (
     is_valid_env_name,
     run_secret_cli,
 )
+
+logger = logging.getLogger(__name__)
 
 TOKEN_ENV = "PROTON_PASS_PERSONAL_ACCESS_TOKEN"  # noqa: S105  # nosec B105
 _MIN_VERSION = (2, 1, 0)
@@ -788,7 +791,13 @@ def _refresh_session_binding(paths: _Paths, token: str, identity_name: str) -> _
     return _SessionBinding(fingerprint, identity_name)
 
 
-def _add_secret(target: dict[str, str], name: Any, value: Any) -> None:
+def _add_secret(
+    target: dict[str, str],
+    name: Any,
+    value: Any,
+    *,
+    ambiguous: set[str] | None = None,
+) -> None:
     if not isinstance(name, str) or len(name) > _MAX_NAME_CHARS or not is_valid_env_name(name):
         raise ValueError("a supported secret field has an invalid environment-variable name")
     if _is_blocked_env_name(name):
@@ -797,8 +806,17 @@ def _add_secret(target: dict[str, str], name: Any, value: Any) -> None:
         raise ValueError("a supported field has an empty or non-string value")
     if len(value) > _MAX_VALUE_CHARS:
         raise ValueError("a supported field value exceeds the decoded size limit")
+    if ambiguous is not None and name in ambiguous:
+        return
     if name in target:
-        raise ValueError("duplicate environment-variable name")
+        if ambiguous is None:
+            raise ValueError("duplicate environment-variable name")
+        # Human metadata names shared by several records are not safe
+        # environment destinations. Omit every value for that name while
+        # retaining unrelated, unambiguous secrets from the same response.
+        target.pop(name, None)
+        ambiguous.add(name)
+        return
     target[name] = value
 
 
@@ -819,7 +837,9 @@ def _field_value(field: Any) -> tuple[Any, Any, bool]:
     return name, value, True
 
 
-def _parse_items(stdout: str) -> dict[str, str]:
+def _parse_items(
+    stdout: str, *, exclude_names: frozenset[str] = frozenset()
+) -> dict[str, str]:
     """Strictly parse one complete `item list --show-secrets` response."""
     try:
         payload = json.loads(stdout)
@@ -829,6 +849,7 @@ def _parse_items(stdout: str) -> dict[str, str]:
         raise ValueError("bulk item output must be an object containing an items array")
 
     found: dict[str, str] = {}
+    ambiguous: set[str] = set()
     # Sort by stable metadata so duplicate detection and diagnostics are deterministic.
     items = payload["items"]
     if len(items) > _MAX_ITEMS:
@@ -865,7 +886,12 @@ def _parse_items(stdout: str) -> dict[str, str]:
         if login is not None:
             if not isinstance(login, dict) or "password" not in login:
                 raise ValueError("Login item is missing its password field")
-            _add_secret(found, title, login.get("password"))
+            # Runtime vaults may also contain ordinary login records whose
+            # human-readable titles are not environment-variable names. They
+            # are outside this source's contract, so ignore them rather than
+            # failing the entire atomic bulk refresh.
+            if title not in exclude_names and is_valid_env_name(title):
+                _add_secret(found, title, login.get("password"), ambiguous=ambiguous)
 
         custom = inner.get("Custom")
         if custom is not None:
@@ -881,16 +907,26 @@ def _parse_items(stdout: str) -> dict[str, str]:
                     raise ValueError("bulk item output exceeds the decoded field limit")
                 for field in section["section_fields"]:
                     name, value, supported = _field_value(field)
-                    if supported:
-                        _add_secret(found, name, value)
+                    if (
+                        supported
+                        and is_valid_env_name(name)
+                        and name not in exclude_names
+                        and value != ""
+                    ):
+                        _add_secret(found, name, value, ambiguous=ambiguous)
 
         field_count += len(extra)
         if field_count > _MAX_FIELDS:
             raise ValueError("bulk item output exceeds the decoded field limit")
         for field in extra:
             name, value, supported = _field_value(field)
-            if supported:
-                _add_secret(found, name, value)
+            if (
+                supported
+                and is_valid_env_name(name)
+                and name not in exclude_names
+                and value != ""
+            ):
+                _add_secret(found, name, value, ambiguous=ambiguous)
 
     return dict(sorted(found.items()))
 
@@ -1041,6 +1077,10 @@ class ProtonPassSource(SecretSource):
                 "description": "Vault values overwrite .env/shell values",
                 "default": False,
             },
+            "exclude_names": {
+                "description": "Exact environment destinations to ignore",
+                "default": [],
+            },
         }
 
     def fetch(self, cfg: dict[str, Any], home_path: Path) -> FetchResult:
@@ -1074,6 +1114,23 @@ class ProtonPassSource(SecretSource):
                 "parses the vault as a positional argument.",
                 ErrorKind.NOT_CONFIGURED,
             )
+
+        raw_exclude_names = cfg.get("exclude_names", [])
+        if not isinstance(raw_exclude_names, list) or not all(
+            isinstance(name, str)
+            and len(name) <= _MAX_NAME_CHARS
+            and is_valid_env_name(name)
+            for name in raw_exclude_names
+        ):
+            return _result_error(
+                "secrets.proton_pass.exclude_names must be a list of valid environment names.",
+                ErrorKind.NOT_CONFIGURED,
+            )
+        exclude_names = frozenset(raw_exclude_names)
+        exclusion_tag = hashlib.sha256(
+            "\n".join(sorted(exclude_names)).encode("utf-8")
+        ).hexdigest()
+        cache_format = f"{_CACHE_FORMAT}:{exclusion_tag}"
 
         bounded_settings = (
             ("command_timeout_seconds", _MAX_COMMAND_TIMEOUT_SECONDS),
@@ -1145,7 +1202,17 @@ class ProtonPassSource(SecretSource):
 
         try:
             with _state_lock(paths.lock, timeout):
-                return self._fetch_locked(binary, paths, home_path, token, vault, timeout, ttl)
+                return self._fetch_locked(
+                    binary,
+                    paths,
+                    home_path,
+                    token,
+                    vault,
+                    timeout,
+                    ttl,
+                    exclude_names,
+                    cache_format,
+                )
         except RuntimeError as exc:
             return _result_error(
                 str(exc),
@@ -1162,6 +1229,8 @@ class ProtonPassSource(SecretSource):
         vault: str,
         timeout: float,
         ttl: float,
+        exclude_names: frozenset[str],
+        cache_format: str,
     ) -> FetchResult:
         if ttl == 0:
             _clear_cache(home_path)
@@ -1174,7 +1243,7 @@ class ProtonPassSource(SecretSource):
                 "The Proton Pass session could not be bound safely.", ErrorKind.INTERNAL, binary
             )
 
-        cache_key: _CacheKey = (binding.fingerprint, vault, _CACHE_FORMAT)
+        cache_key: _CacheKey = (binding.fingerprint, vault, cache_format)
         if ttl > 0:
             _prepare_cache(home_path, create_parent=False)
             raw = _validated_raw_cache(_cache_file(home_path), cache_key, ttl)
@@ -1214,7 +1283,7 @@ class ProtonPassSource(SecretSource):
                 binary,
             )
         try:
-            secrets = _parse_items(proc.stdout)
+            secrets = _parse_items(proc.stdout, exclude_names=exclude_names)
         except ValueError as exc:
             return _result_error(
                 f"Rejected Proton Pass bulk output: {exc}.", ErrorKind.INTERNAL, binary
@@ -1223,7 +1292,7 @@ class ProtonPassSource(SecretSource):
         # Cache only a complete, successfully parsed bulk response, bound to
         # the final tree in case a legitimate CLI read updated session data.
         binding = _refresh_session_binding(paths, token, binding.identity_name)
-        cache_key = (binding.fingerprint, vault, _CACHE_FORMAT)
+        cache_key = (binding.fingerprint, vault, cache_format)
         if ttl > 0:
             _prepare_cache(home_path, create_parent=True)
             fetched_at = time.time()
@@ -1271,3 +1340,23 @@ class ProtonPassSource(SecretSource):
 
 def register(ctx: Any) -> None:
     ctx.register_secret_source(ProtonPassSource())
+
+    # Directory plugins are discovered after Hermes's first dotenv pass.  A
+    # secret-source plugin that only registers here would therefore be too late
+    # for the discovering process itself (notably a launchd/systemd gateway):
+    # its platform and provider credentials are read later in this same
+    # process, before any child exists.  Re-run the supported dotenv loader now
+    # that the source is registered.  The registry/cache keeps this bounded and
+    # the loader is deliberately fail-open, matching normal Hermes startup.
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv, reset_secret_source_cache
+
+        # The core marks a HERMES_HOME applied before directory plugins are
+        # discovered. Clear that supported idempotency guard so this newly
+        # registered source participates in the discovering process.
+        reset_secret_source_cache()
+        load_hermes_dotenv()
+    except Exception:  # pragma: no cover - host integration is fail-open
+        logger.warning(
+            "Proton Pass source registered, but the post-registration secret refresh failed"
+        )

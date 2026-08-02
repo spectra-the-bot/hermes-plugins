@@ -45,6 +45,8 @@ secrets:
     command_timeout_seconds: 30   # finite, positive, maximum 300 seconds
     cache_ttl_seconds: 0          # 0 disables caching; maximum 2,592,000 seconds
     override_existing: false      # opt in only if vault values should overwrite env
+    exclude_names:                # exact environment destinations to ignore
+      - PROTON_PASS_AGENT_TOKEN   # keep interactive credentials out of runtime
 ```
 
 Store the PAT through the installer prompt or in the active profile's Hermes
@@ -70,9 +72,10 @@ must set an absolute `binary_path` because Proton does not document one stable
 system-wide installation location.
 
 Restart Hermes after installation/configuration. Directory plugins are
-discovered after the first dotenv load in the discovering process, so the
-source applies to subsequently spawned Hermes processes (gateway children,
-cron sessions, and subagents).
+discovered after Hermes's first dotenv pass, so this plugin performs one
+post-registration refresh through Hermes's supported loader. Secrets are
+therefore available to the discovering gateway process as well as its later
+cron sessions and subagents.
 
 ## Supported item mapping
 
@@ -87,10 +90,16 @@ shapes are mapped:
 
 Exactly `Trashed` items are ignored. Exactly `Active` items are parsed; every
 other or missing state rejects the fetch. Unknown item types and unsupported
-field variants are ignored. Invalid environment names, empty supported values,
-duplicate names, malformed active item structures, malformed JSON, partial
-output, or configured structural-size limits reject the **entire** fetch.
-Values are never logged.
+field variants are ignored. Login titles that are not environment names are
+treated as ordinary vault records and ignored. Invalid or empty optional custom
+metadata is also ignored. If several supported fields target the same name,
+that ambiguous destination is omitted while unrelated destinations remain.
+An empty or non-string password on an otherwise exportable Login item,
+malformed active item structure, malformed JSON, partial output, or configured
+structural-size limit rejects the **entire** fetch. `exclude_names` is applied
+before runtime-control validation and is included in the plaintext-cache key,
+so changing exclusions cannot reuse stale cached values. Values are never
+logged.
 
 Runtime-control destinations are compared case-insensitively against a
 conservative denylist and reject the entire fetch. Categories include process

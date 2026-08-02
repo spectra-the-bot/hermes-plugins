@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.1.0
+
+- Refresh Hermes's supported secret loader immediately after directory-plugin
+  registration so a freshly launched gateway receives runtime secrets in the
+  discovering process.
+- Tolerate mixed-use vaults by ignoring ordinary Login titles and empty or
+  invalid optional metadata, and by omitting ambiguous duplicate destinations
+  without discarding unrelated secrets.
+- Add exact `exclude_names` filtering for protected interactive credentials and
+  bind the exclusion set into the plaintext-cache key.
 - Bound each command timeout to 300 seconds, the derived host fetch budget to
   1,815 seconds, plaintext cache TTL to 30 days, and isolated session-tree
   inspection to 1,024 entries and 64 MiB of regular files.
