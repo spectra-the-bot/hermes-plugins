@@ -43,10 +43,12 @@ jobs:
           typecheck_dir="$(mktemp -d)"
           trap 'rm -rf "$typecheck_dir"' EXIT
           cp proton-pass/__init__.py "$typecheck_dir/proton_pass.py"
+          cp discord-provisioning/__init__.py "$typecheck_dir/discord_provisioning.py"
           MYPYPATH="$GITHUB_WORKSPACE/.hermes-agent" \
             PYTHONPATH="$GITHUB_WORKSPACE/.hermes-agent" \
             uvx mypy --follow-imports=silent --ignore-missing-imports \
-              "$typecheck_dir/proton_pass.py"
+              "$typecheck_dir/proton_pass.py" \
+              "$typecheck_dir/discord_provisioning.py"
       - run: git diff --check
       - run: uv run --no-project --python 3.13 --with pytest --with pyyaml --with rich pytest tests/test_install_smoke.py -q
         env:
