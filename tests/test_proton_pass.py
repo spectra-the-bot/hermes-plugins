@@ -72,7 +72,7 @@ def fake_cli(tmp_path: Path, monkeypatch, plugin_module):
     def completed(argv, returncode=0, stdout="", stderr=""):
         return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
 
-    def fake_run(argv, *, env, capture_output, text, timeout, stdin):
+    def fake_run(argv, *, env, capture_output, text, encoding, errors, timeout, stdin):
         args = list(argv[1:])
         entries.append(
             {
@@ -86,6 +86,8 @@ def fake_cli(tmp_path: Path, monkeypatch, plugin_module):
         )
         assert capture_output is True
         assert text is True
+        assert encoding == "utf-8"
+        assert errors == "replace"
         if (
             config.get("sleep_command") == " ".join(args)
             and float(config.get("sleep", 1)) > timeout
@@ -404,9 +406,7 @@ def test_partial_json_fails_closed_and_is_not_cached(source, configured, tmp_pat
         [login_item("NOT_STRING", 7)],
     ],
 )
-def test_empty_supported_values_fail_atomically(
-    source, configured, tmp_path, items
-):
+def test_empty_supported_values_fail_atomically(source, configured, tmp_path, items):
     cfg, configure, _ = configured
     configure(payload={"items": items})
     result = source.fetch(cfg, tmp_path)
@@ -433,9 +433,7 @@ def test_duplicate_destination_is_omitted_without_losing_unrelated_secrets(
     assert result.secrets == {"KEEP": "safe"}
 
 
-def test_non_environment_login_titles_and_custom_fields_are_ignored(
-    source, configured, tmp_path
-):
+def test_non_environment_login_titles_and_custom_fields_are_ignored(source, configured, tmp_path):
     cfg, configure, _ = configured
     configure(
         payload={

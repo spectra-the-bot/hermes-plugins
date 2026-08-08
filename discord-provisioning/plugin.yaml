@@ -1,0 +1,17 @@
+manifest_version: 1
+name: discord-provisioning
+version: 1.0.0
+description: "Reusable Discord channel, role, and permission-overwrite provisioning through a separately allowlisted Hermes tool."
+author: spectra-the-bot
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
+provides_tools:
+  - discord_provisioning
+requires_env:
+  - name: DISCORD_BOT_TOKEN
+    description: "Discord bot token for the active Hermes profile"
+    url: "https://discord.com/developers/applications"
+    secret: true
