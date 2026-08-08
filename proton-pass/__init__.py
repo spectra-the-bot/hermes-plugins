@@ -837,9 +837,7 @@ def _field_value(field: Any) -> tuple[Any, Any, bool]:
     return name, value, True
 
 
-def _parse_items(
-    stdout: str, *, exclude_names: frozenset[str] = frozenset()
-) -> dict[str, str]:
+def _parse_items(stdout: str, *, exclude_names: frozenset[str] = frozenset()) -> dict[str, str]:
     """Strictly parse one complete `item list --show-secrets` response."""
     try:
         payload = json.loads(stdout)
@@ -920,12 +918,7 @@ def _parse_items(
             raise ValueError("bulk item output exceeds the decoded field limit")
         for field in extra:
             name, value, supported = _field_value(field)
-            if (
-                supported
-                and is_valid_env_name(name)
-                and name not in exclude_names
-                and value != ""
-            ):
+            if supported and is_valid_env_name(name) and name not in exclude_names and value != "":
                 _add_secret(found, name, value, ambiguous=ambiguous)
 
     return dict(sorted(found.items()))
@@ -1117,9 +1110,7 @@ class ProtonPassSource(SecretSource):
 
         raw_exclude_names = cfg.get("exclude_names", [])
         if not isinstance(raw_exclude_names, list) or not all(
-            isinstance(name, str)
-            and len(name) <= _MAX_NAME_CHARS
-            and is_valid_env_name(name)
+            isinstance(name, str) and len(name) <= _MAX_NAME_CHARS and is_valid_env_name(name)
             for name in raw_exclude_names
         ):
             return _result_error(
@@ -1127,9 +1118,7 @@ class ProtonPassSource(SecretSource):
                 ErrorKind.NOT_CONFIGURED,
             )
         exclude_names = frozenset(raw_exclude_names)
-        exclusion_tag = hashlib.sha256(
-            "\n".join(sorted(exclude_names)).encode("utf-8")
-        ).hexdigest()
+        exclusion_tag = hashlib.sha256("\n".join(sorted(exclude_names)).encode("utf-8")).hexdigest()
         cache_format = f"{_CACHE_FORMAT}:{exclusion_tag}"
 
         bounded_settings = (

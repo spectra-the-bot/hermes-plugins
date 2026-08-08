@@ -22,7 +22,7 @@ jobs:
           repository: NousResearch/hermes-agent
           path: .hermes-agent
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-      - run: uv run --no-project --python ${{ matrix.python }} --with pytest --with pyyaml --with rich pytest -q
+      - run: uv run --no-project --python ${{ matrix.python }} --with pytest --with pyyaml --with rich --with python-dotenv pytest -q
         env:
           HERMES_AGENT_SRC: ${{ github.workspace }}/.hermes-agent
 
@@ -50,6 +50,6 @@ jobs:
               "$typecheck_dir/proton_pass.py" \
               "$typecheck_dir/discord_provisioning.py"
       - run: git diff --check
-      - run: uv run --no-project --python 3.13 --with pytest --with pyyaml --with rich pytest tests/test_install_smoke.py -q
+      - run: uv run --no-project --python 3.13 --with pytest --with pyyaml --with rich --with python-dotenv pytest tests/test_install_smoke.py -q
         env:
           HERMES_AGENT_SRC: ${{ github.workspace }}/.hermes-agent
