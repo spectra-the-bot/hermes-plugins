@@ -20,9 +20,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: NousResearch/hermes-agent
+          ref: 524041b9d0437cd4424a524af4b9e26145e69ab0 # tested host API baseline
           path: .hermes-agent
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-      - run: uv run --no-project --python ${{ matrix.python }} --with pytest --with pyyaml --with rich --with python-dotenv pytest -q
+      - run: uv run --no-project --python ${{ matrix.python }} --with pytest --with pyyaml --with rich --with python-dotenv --with httpx==0.28.1 --with psutil==7.2.2 --with aiohttp==3.14.3 pytest -q
         env:
           HERMES_AGENT_SRC: ${{ github.workspace }}/.hermes-agent
 
@@ -33,6 +34,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: NousResearch/hermes-agent
+          ref: 524041b9d0437cd4424a524af4b9e26145e69ab0 # tested host API baseline
           path: .hermes-agent
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - run: uvx ruff check .
@@ -44,12 +46,16 @@ jobs:
           trap 'rm -rf "$typecheck_dir"' EXIT
           cp proton-pass/__init__.py "$typecheck_dir/proton_pass.py"
           cp discord-provisioning/__init__.py "$typecheck_dir/discord_provisioning.py"
+          cp -R progress-narrator "$typecheck_dir/progress_narrator"
           MYPYPATH="$GITHUB_WORKSPACE/.hermes-agent" \
             PYTHONPATH="$GITHUB_WORKSPACE/.hermes-agent" \
             uvx mypy --follow-imports=silent --ignore-missing-imports \
               "$typecheck_dir/proton_pass.py" \
               "$typecheck_dir/discord_provisioning.py"
+          # Check our package without type-checking the gateway's transitive dependency graph.
+          uvx mypy --follow-imports=skip --ignore-missing-imports \
+              "$typecheck_dir/progress_narrator"
       - run: git diff --check
-      - run: uv run --no-project --python 3.13 --with pytest --with pyyaml --with rich --with python-dotenv pytest tests/test_install_smoke.py -q
+      - run: uv run --no-project --python 3.13 --with pytest --with pyyaml --with rich --with python-dotenv --with httpx==0.28.1 --with psutil==7.2.2 --with aiohttp==3.14.3 pytest tests/test_install_smoke.py -q
         env:
           HERMES_AGENT_SRC: ${{ github.workspace }}/.hermes-agent
