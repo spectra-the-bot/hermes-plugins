@@ -1,6 +1,6 @@
 manifest_version: 1
 name: progress-narrator
-version: 0.1.0
+version: 0.1.1
 requires_hermes: ">=0.21.4"
 description: "Bounded LLM-generated progress updates from tool activity, using Hermes auxiliary models and shared delivery."
 author: spectra-the-bot

@@ -105,6 +105,27 @@ def tick_after(harness, seconds):
     harness.narrator._tick(harness.turn)
 
 
+def test_summary_input_contains_only_tool_activity(make_narrator):
+    h = make_narrator("Read files and ran terminal commands.")
+    turn = h.narrator.begin(
+        "session-a",
+        "tool-only-turn",
+        "Steve asks whether the plugin is live.",
+        lambda _text: True,
+    )
+    assert turn.task == ""
+    record_calls(h, turn=turn)
+    h.clock.advance(20)
+    h.narrator._tick(turn)
+    instructions, payload = h.summary.requests[0]
+    assert set(payload) == {"recent_activity", "currently_running", "previous_update"}
+    assert "Steve" not in json.dumps(payload)
+    assert "plugin is live" not in json.dumps(payload)
+    assert "Summarize tool activity only" in instructions
+    assert "Do not discuss evidence" in instructions
+    assert "Do not mention the user" in instructions
+
+
 def test_default_settings(core):
     settings = core.Settings()
     assert settings.every_calls == 6
@@ -657,7 +678,7 @@ def test_custom_redactor_applies_to_tasks_targets_and_excerpts(core, make_narrat
         "Inspect unit-private-name",
         lambda _text: True,
     )
-    assert other.task == "Inspect [name]"
+    assert other.task == ""
     event = core.event_from_tool(
         "read_file",
         {"path": "/private/unit-private-name.txt"},

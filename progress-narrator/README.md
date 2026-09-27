@@ -6,7 +6,7 @@ results, the system prompt, conversation history, or the main model's behavior.
 
 Example style (illustrative, not a test result):
 
-> I checked the configuration and found a failed connection attempt. I am reviewing the available settings.
+> Read configuration files and ran terminal commands.
 
 ## Behavior
 
@@ -14,7 +14,7 @@ Example style (illustrative, not a test result):
 - Generates an update after six completed tool calls, with a 20-second minimum interval.
 - A 45-second timer can report new activity before six calls complete.
 - Timer ticks do not repeatedly summarize unchanged evidence.
-- Emits one or two short sentences; the model can return `SKIP` for repetitive activity.
+- Emits one short sentence about tool activity only; returns `SKIP` for repetitive activity.
 - Runs model and delivery work in a background thread, never inside the tool observer.
 - Keeps a bounded event window for each turn; limits concurrent turns and delivered updates.
 - Preserves the authorized source's receiving-bot and relay identity.
@@ -24,8 +24,9 @@ Example style (illustrative, not a test result):
 - Discards pending updates on available completion, stop, reset, and unload hooks.
 - Does not expose tools or grant the summarizer the ability to take actions.
 
-The default evidence contains the user's bounded task text, tool names, selected
-file basenames, completion/error states, and a few numeric result fields. It does
+The default input contains tool names, selected file basenames, completion/error
+states, and a few numeric result fields. User questions and conversation text are
+not retained or sent to the summarizer. It does
 **not** include raw commands, search queries, full arguments, file contents, or
 raw result text. This makes default summaries primarily activity summaries,
 not detailed findings. Sanitized result excerpts are an explicit opt-in.
@@ -149,12 +150,12 @@ logged so operators can verify which provider and model actually answered.
 
 ## Privacy and failure behavior
 
-- The summarizer receives only this turn's bounded evidence and previous update.
+- The summarizer receives only this turn's bounded tool records and previous update.
 - Known sensitive tools contribute a generic protected-context label only.
 - Host secret redaction runs with `force=True`; additional token/email/URL filtering applies.
 - Sanitization is defense in depth, **not a guarantee against arbitrary confidential text**.
 - Enabling result excerpts can send private document content to the configured model.
-- Use a suitable local/private route when task text itself is sensitive.
+- Use a suitable local/private route when tool metadata or opted-in excerpts are sensitive.
 - Prompt injection in evidence is treated as untrusted data; the summarizer has no tools.
 - Model errors, missing transport, unsupported contexts, and delivery failures leave the main task running.
 - Logs contain model attribution and generic failure messages, not prompts or tool results.
