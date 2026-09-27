@@ -157,22 +157,23 @@ def test_discord_provisioning_clean_install_and_discovery(tmp_path, monkeypatch)
 
     built_in_admin = tool_registry._tools["discord_admin"]
     tool_registry.deregister("discord_provisioning")
+    manager = PluginManager()
     try:
-        manager = PluginManager()
         manager.discover_and_load()
         loaded = manager.list_plugins()
         plugin = next(entry for entry in loaded if entry["name"] == "discord-provisioning")
         assert plugin["enabled"] is True
         assert plugin["error"] is None
 
-        entry = tool_registry._tools["discord_provisioning"]
+        entry = tool_registry.get_entry("discord_provisioning", scope=manager.scope_key)
+        assert entry is not None
         assert entry.toolset == "discord-provisioning"
         assert entry.schema["name"] == "discord_provisioning"
         assert entry.requires_env == ["DISCORD_BOT_TOKEN"]
         assert tool_registry._tools["discord_admin"] is built_in_admin
         assert "discord-provisioning" in _get_plugin_toolset_keys()
     finally:
-        tool_registry.deregister("discord_provisioning")
+        manager.unload("discord-provisioning")
 
     artifact_files = {
         path.relative_to(destination).as_posix()

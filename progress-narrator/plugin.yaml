@@ -1,0 +1,23 @@
+manifest_version: 1
+name: progress-narrator
+version: 0.1.0
+requires_hermes: ">=0.21.4"
+description: "Bounded LLM-generated progress updates from tool activity, using Hermes auxiliary models and shared delivery."
+author: spectra-the-bot
+kind: standalone
+license: MIT
+homepage: https://github.com/spectra-the-bot/hermes-plugins/tree/main/progress-narrator
+provides_hooks:
+  - pre_gateway_dispatch
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - post_llm_call
+  - on_session_end
+  - agent_loop_stopped
+  - on_session_finalize
+  - on_session_reset
+platforms:
+  - linux
+  - macos
+  - windows
