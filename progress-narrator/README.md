@@ -13,7 +13,10 @@ Example style (illustrative, not a test result):
 - Uses a separately configured Hermes auxiliary model and host-managed credentials.
 - Generates an update after six completed tool calls, with a 20-second minimum interval.
 - A 45-second timer can report new activity before six calls complete.
-- Timer ticks do not repeatedly summarize unchanged evidence.
+- Each attempt consumes only new tool records; previous file reads are not replayed.
+- The model skips more of the same activity instead of paraphrasing the previous update.
+- A running tool can receive a brief continuation after 180 seconds without a delivered update.
+- An open turn alone never triggers a heartbeat: fresh calls or a running tool are required.
 - Emits one short sentence about tool activity only; returns `SKIP` for repetitive activity.
 - Runs model and delivery work in a background thread, never inside the tool observer.
 - Keeps a bounded event window for each turn; limits concurrent turns and delivered updates.
@@ -128,12 +131,25 @@ plugins:
       every_calls: 6
       min_seconds: 20
       max_seconds: 45
+      heartbeat_seconds: 180
       max_events: 24
       max_updates: 20
       max_turn_seconds: 1800
       include_result_excerpts: false
       excerpt_chars: 240
 ```
+
+For a quieter, conversational cadence, use `every_calls: 12`, `min_seconds: 90`,
+`max_seconds: 180`, and `heartbeat_seconds: 180`. This allows changed activity at
+most once per 90 seconds and a short continuation after about three minutes of
+ongoing tool activity. These are eligibility timers, not delivery guarantees:
+the model can return `SKIP`, and generation or delivery can fail. Silent model
+reasoning without observable tool activity does not generate artificial check-ins.
+
+Settings are captured on each new turn; cadence edits do not require a restart.
+Code/prompt upgrades still require a new gateway process. Each summary attempt
+consumes its batch even on `SKIP` or failure; new calls during generation remain
+queued. Narration is a best-effort activity view, not an audit log.
 
 Use `hermes config set` to update values. For example:
 

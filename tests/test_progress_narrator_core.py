@@ -118,7 +118,12 @@ def test_summary_input_contains_only_tool_activity(make_narrator):
     h.clock.advance(20)
     h.narrator._tick(turn)
     instructions, payload = h.summary.requests[0]
-    assert set(payload) == {"recent_activity", "currently_running", "previous_update"}
+    assert set(payload) == {
+        "recent_activity",
+        "currently_running",
+        "previous_update",
+        "continuation_due",
+    }
     assert "Steve" not in json.dumps(payload)
     assert "plugin is live" not in json.dumps(payload)
     assert "Summarize tool activity only" in instructions
@@ -314,6 +319,133 @@ def test_new_evidence_during_summary_survives_for_next_attempt(make_narrator):
     tick_after(h, 45)
     assert len(requests) == 2
     assert requests[1]["recent_activity"][-1]["exit_code"] == 7
+    assert len(requests[1]["recent_activity"]) == 1
+
+
+def test_each_summary_sees_only_new_tool_records(make_narrator):
+    h = make_narrator("Read the implementation.", "Read the tests.")
+    h.narrator.record(*h.turn.key, tool_name="read_file", args={"path": "/src/core.py"})
+    tick_after(h, 45)
+    assert not h.turn.events
+    h.narrator.record(*h.turn.key, tool_name="read_file", args={"path": "/tests/test_core.py"})
+    tick_after(h, 45)
+    assert [e["target"] for e in h.summary.requests[1][1]["recent_activity"]] == ["test_core.py"]
+    assert not h.summary.requests[1][1]["continuation_due"]
+
+
+def test_identical_records_are_collapsed_in_model_input(make_narrator):
+    h = make_narrator("Ran a command.")
+    record_calls(h, 6)
+    tick_after(h, 20)
+    assert len(h.summary.requests[0][1]["recent_activity"]) == 1
+
+
+def test_changed_activity_does_not_inherit_previous_wording(make_narrator):
+    h = make_narrator("Read files.", "Patched the implementation.")
+    h.narrator.record(*h.turn.key, tool_name="read_file")
+    tick_after(h, 45)
+    h.narrator.record(*h.turn.key, tool_name="patch")
+    tick_after(h, 180)
+    payload = h.summary.requests[1][1]
+    assert payload["previous_update"] == ""
+    assert payload["continuation_due"] is False
+
+
+def test_skipped_batch_is_not_replayed(make_narrator):
+    h = make_narrator("SKIP", "Applied a patch.")
+    h.narrator.record(*h.turn.key, tool_name="read_file", args={"path": "old.py"})
+    tick_after(h, 45)
+    h.narrator.record(*h.turn.key, tool_name="patch", args={"path": "new.py"})
+    tick_after(h, 45)
+    assert [e["target"] for e in h.summary.requests[1][1]["recent_activity"]] == ["new.py"]
+
+
+def test_long_running_tool_gets_spaced_continuation(make_narrator):
+    h = make_narrator("Running a command.", "Still running the command.")
+    h.narrator.record(*h.turn.key, tool_name="terminal", tool_call_id="long", started=True)
+    tick_after(h, 45)
+    tick_after(h, 179)
+    assert len(h.summary.requests) == 1
+    tick_after(h, 1)
+    assert len(h.delivered) == 2
+    payload = h.summary.requests[1][1]
+    assert payload["continuation_due"] is True
+    assert payload["currently_running"] == ["terminal"]
+    assert payload["recent_activity"] == []
+    assert (
+        payload["previous_update"] == ""
+    )  # Old activity cannot leak into a running-only heartbeat.
+
+
+def test_heartbeat_does_not_replay_finished_work(make_narrator):
+    h = make_narrator("Read files.")
+    record_calls(h)
+    tick_after(h, 20)
+    tick_after(h, 180)
+    assert len(h.summary.requests) == 1
+
+
+def test_heartbeat_uses_last_delivery_not_last_attempt(make_narrator):
+    h = make_narrator("Read files.", "SKIP", "Still running a command.")
+    record_calls(h)
+    tick_after(h, 20)
+    record_calls(h)
+    tick_after(h, 20)
+    h.narrator.record(*h.turn.key, tool_name="terminal", tool_call_id="long", started=True)
+    tick_after(h, 160)
+    assert h.summary.requests[2][1]["continuation_due"] is True
+    assert len(h.delivered) == 2
+
+
+def test_heartbeat_can_repeat_text_only_after_quiet_interval(make_narrator):
+    h = make_narrator("Running a command.", "Running a command.")
+    h.narrator.record(*h.turn.key, tool_name="terminal", tool_call_id="long", started=True)
+    tick_after(h, 45)
+    tick_after(h, 180)
+    assert h.delivered == ["Running a command.", "Running a command."]
+
+
+def test_running_tool_finishing_during_heartbeat_suppresses_stale_update(make_narrator):
+    calls = []
+
+    def summarize(_system, payload):
+        calls.append(json.loads(payload))
+        if len(calls) == 2:
+            h.narrator.record(*h.turn.key, tool_name="terminal", tool_call_id="long")
+        return "Still running a command."
+
+    h = make_narrator(summarize=summarize)
+    h.narrator.record(*h.turn.key, tool_name="terminal", tool_call_id="long", started=True)
+    tick_after(h, 45)
+    tick_after(h, 180)
+    assert len(calls) == 2
+    assert len(h.delivered) == 1
+    assert len(h.turn.events) == 1
+
+
+def test_quieter_profile_cadence(core, make_narrator):
+    h = make_narrator(
+        "Read files.",
+        "Ran commands.",
+        settings=core.Settings(every_calls=12, min_seconds=90, max_seconds=180),
+    )
+    record_calls(h, 11)
+    tick_after(h, 90)
+    assert not h.summary.requests
+    record_calls(h, 1)
+    h.narrator._tick(h.turn)
+    assert len(h.summary.requests) == 1
+    record_calls(h, 6)
+    tick_after(h, 90)
+    assert len(h.summary.requests) == 1
+    tick_after(h, 90)
+    assert len(h.summary.requests) == 2
+
+
+@pytest.mark.parametrize("value", [True, "180", 0, 29, 3601, float("nan")])
+def test_heartbeat_interval_validation(core, value):
+    with pytest.raises((TypeError, ValueError)):
+        core.Settings(heartbeat_seconds=value)
 
 
 def test_begin_replaces_existing_turn_in_same_session(make_narrator):
