@@ -25,6 +25,138 @@ def plugin():
     return module
 
 
+def test_summary_delegates_routing_fallbacks_and_timeout_to_host(plugin, caplog):
+    import logging
+
+    complete = Mock(
+        return_value=SimpleNamespace(
+            text="Reading implementation files.",
+            provider="custom:spark",
+            model="qwen3.8-flash-next",
+        )
+    )
+    narrator = plugin.Plugin(SimpleNamespace(llm=SimpleNamespace(complete=complete)))
+    with caplog.at_level(logging.INFO):
+        assert narrator.summarize("tool-only instructions", "{}") == "Reading implementation files."
+    kwargs = complete.call_args.kwargs
+    assert kwargs["task"] == "progress_narrator"
+    assert not {"provider", "model", "timeout"}.intersection(kwargs)
+    assert kwargs["max_tokens"] == 160
+    assert "model=qwen3.8-flash-next provider=custom:spark" in caplog.text
+    narrator.close()
+
+
+class MissingModelError(Exception):
+    status_code = 404
+    body = {"error": {"message": "The requested model does not exist.", "param": "model"}}
+
+
+def test_missing_models_walk_ordered_configured_models(plugin, monkeypatch):
+    primary = MissingModelError("primary missing")
+    complete = Mock(
+        side_effect=[
+            primary,
+            MissingModelError("first fallback missing"),
+            SimpleNamespace(text="Reading files.", provider="custom:spark", model="second"),
+        ]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "progress_narrator": {
+                    "provider": "custom:spark",
+                    "model": "primary",
+                    "fallback_chain": [
+                        {"provider": "custom:spark", "model": "primary"},
+                        {"provider": "custom:spark", "model": "first", "timeout": 17},
+                        {"provider": "custom:spark", "model": "first"},
+                        {"provider": "custom:spark", "model": "second"},
+                    ],
+                }
+            }
+        },
+    )
+    narrator = plugin.Plugin(SimpleNamespace(llm=SimpleNamespace(complete=complete)))
+    assert narrator.summarize("rules", "{}") == "Reading files."
+    calls = [c.kwargs for c in complete.call_args_list]
+    assert [c.get("model") for c in calls] == [None, "first", "second"]
+    assert calls[1]["timeout"] == 17
+    assert "timeout" not in calls[2]
+    assert all(c["task"] == "progress_narrator" for c in calls)
+    assert all(c["messages"] == calls[0]["messages"] for c in calls)
+
+
+@pytest.mark.parametrize(
+    "status,message",
+    [
+        (404, "Endpoint not found"),
+        (401, "Model not found"),
+        (400, "Invalid temperature"),
+        (429, "Too many requests"),
+        (503, "Service unavailable"),
+    ],
+)
+def test_other_errors_are_left_to_host_recovery(plugin, status, message):
+    error = RuntimeError(message)
+    error.status_code = status
+    error.body = {"message": message}
+    complete = Mock(side_effect=error)
+    narrator = plugin.Plugin(SimpleNamespace(llm=SimpleNamespace(complete=complete)))
+    with pytest.raises(RuntimeError) as caught:
+        narrator.summarize("rules", "{}")
+    assert caught.value is error
+    assert complete.call_count == 1
+
+
+def test_missing_model_chain_exhaustion_raises_original(plugin, monkeypatch):
+    primary = MissingModelError("primary missing")
+    complete = Mock(side_effect=[primary, MissingModelError("fallback missing")])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "progress_narrator": {
+                    "provider": "custom:spark",
+                    "model": "primary",
+                    "fallback_chain": [{"provider": "custom:spark", "model": "alternate"}],
+                }
+            }
+        },
+    )
+    narrator = plugin.Plugin(SimpleNamespace(llm=SimpleNamespace(complete=complete)))
+    with pytest.raises(MissingModelError) as caught:
+        narrator.summarize("rules", "{}")
+    assert caught.value is primary
+    assert complete.call_count == 2
+
+
+def test_missing_model_fallback_rejects_ignored_route_override(plugin, monkeypatch):
+    complete = Mock(side_effect=MissingModelError("primary missing"))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "progress_narrator": {
+                    "provider": "custom:spark",
+                    "model": "primary",
+                    "fallback_chain": [
+                        {
+                            "provider": "custom",
+                            "model": "alternate",
+                            "base_url": "https://different.invalid/v1",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+    narrator = plugin.Plugin(SimpleNamespace(llm=SimpleNamespace(complete=complete)))
+    with pytest.raises(ValueError, match="named providers"):
+        narrator.summarize("rules", "{}")
+    assert complete.call_count == 1
+
+
 def origin(plugin, platform="matrix", thread="thread-1"):
     return plugin.Origin(
         platform,
@@ -251,6 +383,6 @@ def test_auxiliary_call_uses_registered_task_not_main_loop(plugin):
     assert instance.summarize("rules", "evidence") == "Checking settings."
     kwargs = ctx.llm.complete.call_args.kwargs
     assert kwargs["task"] == "progress_narrator"
-    assert kwargs["timeout"] == 12
+    assert "timeout" not in kwargs  # The host applies task and fallback-specific timeouts.
     assert kwargs["max_tokens"] == 160
     assert not ctx.dispatch_tool.called

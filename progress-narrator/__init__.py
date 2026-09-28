@@ -176,18 +176,81 @@ class Plugin:
             return
         self.gateway, self.loop = gateway, loop
 
+    @staticmethod
+    def _missing_model(error: Exception) -> bool:
+        # A generic endpoint 404 must not trigger model hopping.
+        if getattr(error, "status_code", None) not in (400, 404):
+            return False
+        body = getattr(error, "body", None)
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            body = body["error"]
+        message = str(body.get("message", "")) if isinstance(body, dict) else str(error)
+        message = message.casefold()
+        return "model" in message and any(
+            marker in message
+            for marker in (
+                "does not exist",
+                "not found",
+                "unknown model",
+                "not loaded",
+                "model_not_found",
+            )
+        )
+
     def summarize(self, instructions: str, evidence: str) -> str:
-        result = self.ctx.llm.complete(
-            messages=[
+        request = {
+            "messages": [
                 {"role": "system", "content": instructions},
                 {"role": "user", "content": evidence},
             ],
-            task=TASK,
-            max_tokens=160,
-            temperature=0.2,
-            timeout=12,
-            purpose="progress-narrator.summary",
-        )
+            "task": TASK,
+            "max_tokens": 160,
+            "temperature": 0.2,
+            "purpose": "progress-narrator.summary",
+        }
+        try:
+            result = self.ctx.llm.complete(**request)
+        except Exception as primary_error:
+            if not self._missing_model(primary_error):
+                raise
+            # Host recovery handles transport/capacity failures. Its model-error
+            # classifier does not cover every local server's missing-model response.
+            from hermes_cli.config import load_config_readonly
+
+            route = load_config_readonly().get("auxiliary", {}).get(TASK, {})
+            chain = route.get("fallback_chain", [])
+            if not isinstance(chain, list):
+                raise
+            tried = {(route.get("provider"), route.get("model"))}
+            for entry in chain:
+                if not isinstance(entry, dict):
+                    continue
+                provider, model = entry.get("provider"), entry.get("model")
+                if not isinstance(provider, str) or not provider.strip():
+                    continue
+                if not isinstance(model, str) or not model.strip() or (provider, model) in tried:
+                    continue
+                # The facade cannot override an endpoint/key. Use a named provider
+                # for another endpoint rather than silently ignoring route fields.
+                if any(entry.get(key) for key in ("base_url", "api_key", "api_mode", "transport")):
+                    raise ValueError(
+                        "Missing-model fallbacks require named providers without route overrides"
+                    ) from None
+                tried.add((provider, model))
+                fallback = {**request, "provider": provider, "model": model}
+                if "timeout" in entry:
+                    fallback["timeout"] = entry["timeout"]
+                LOG.info(
+                    "Progress summary missing model; trying provider=%s model=%s", provider, model
+                )
+                try:
+                    result = self.ctx.llm.complete(**fallback)
+                    break
+                except Exception as error:
+                    if not self._missing_model(error):
+                        raise
+            else:
+                raise primary_error
         # Attribution only. Never log prompts, results, or credentials.
         LOG.info("Progress summary model=%s provider=%s", result.model, result.provider)
         return str(result.text)
