@@ -34,6 +34,61 @@ not retained or sent to the summarizer. It does
 raw result text. This makes default summaries primarily activity summaries,
 not detailed findings. Sanitized result excerpts are an explicit opt-in.
 
+## Model fallbacks for model-swapping endpoints
+
+The plugin delegates routing to Hermes's auxiliary client, including its ordered
+`fallback_chain`. No separate plugin-specific model list is needed.
+Use exact served model IDs. For example:
+
+```yaml
+auxiliary:
+  progress_narrator:
+    provider: custom:spark
+    model: GLM-5.3-Flash-EXL3
+    timeout: 12
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+    fallback_chain:
+      - provider: custom:spark
+        model: qwen3.8-flash-next
+        timeout: 12
+```
+
+Append additional provider/model entries to `fallback_chain` in preference order.
+They can use the same named provider or another configured endpoint. The plugin
+uses the task timeout; each fallback can set its own timeout. Task request-body
+options also reach the fallback, so keep those options compatible with every model.
+
+Hermes handles its recognized transport/capacity failures. The plugin additionally
+handles explicit model-not-found responses (HTTP 400/404), which some host versions
+do not classify for fallback. It tries the configured entries in order through the
+host model facade, skips duplicate routes, and stops on unrelated errors. A generic
+endpoint 404 does not trigger this model-specific retry.
+
+Enable the facade permissions for this plugin when using missing-model fallbacks:
+
+```yaml
+plugins:
+  entries:
+    progress-narrator:
+      llm:
+        allow_provider_override: true
+        allow_model_override: true
+```
+
+Use named providers for fallback endpoints. The model-not-found retry rejects
+per-entry `base_url`, `api_key`, `api_mode`, or `transport` overrides rather than
+silently routing them elsewhere; put endpoint/auth settings in the named provider.
+Model IDs must match what the endpoint serves. This is an ordered configured list,
+not automatic selection of arbitrary catalog models. Ordinary model swaps then
+need no narrator configuration edit.
+
+The host owns failure classification and retries. It may use the main agent model
+if the configured chain is exhausted; this list is not a strict provider allowlist.
+The plugin logs the actual returned provider/model rather than assuming the primary
+served the summary. Config edits do not require reinstalling the plugin.
+
 ## Surface support
 
 The implementation uses the originating gateway's shared adapter interface. It
